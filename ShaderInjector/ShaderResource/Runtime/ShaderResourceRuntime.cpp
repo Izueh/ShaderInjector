@@ -25,8 +25,11 @@
 #include "ShaderResource/Runtime/DescriptorAllocation.h"
 #include "ShaderResource/Runtime/DescriptorExecutionSlot.h"
 #include "ShaderResource/Runtime/DescriptorHeapPage.h"
+#include "ShaderResource/Runtime/DescriptorOverride.h"
 #include "ShaderResource/Runtime/QueueFence.h"
 #include "ShaderResource/Runtime/RootTableRestore.h"
+#include "ShaderResource/Runtime/ScopedResourceBindingBatch.h"
+#include "ShaderResource/Runtime/SamplerOverride.h"
 #include "ShaderResource/Runtime/TextureGPU.h"
 #include "DDS/DDS.h"
 #include "StringHelper.h"
@@ -48,6 +51,7 @@ namespace ShaderResourceRuntime
 		std::atomic<uint32_t> gRecordedCommandListCount = 0;
 		thread_local ID3D12GraphicsCommandList* gCachedCommandList = nullptr;
 		thread_local CommandListSlot* gCachedCommandListSlot = nullptr;
+		thread_local ID3D12GraphicsCommandList* gResourceBindingBatchCommandList = nullptr;
 
 		CommandListSlot& GetCommandListSlot(ID3D12GraphicsCommandList* commandList)
 		{
@@ -137,7 +141,9 @@ namespace ShaderResourceRuntime
 			D3D12_DESCRIPTOR_HEAP_TYPE heapType,
 			UINT descriptorCount,
 			DescriptorAllocation& outAllocation,
-			std::string& outError)
+			std::string& outError,
+			ID3D12DescriptorHeap* preferredHeap = nullptr,
+			UINT fallbackDescriptorCount = 0)
 		{
 			outAllocation = {};
 
@@ -149,8 +155,10 @@ namespace ShaderResourceRuntime
 				return false;
 			}
 
-			if (heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER &&
-				descriptorCount > defaultSamplerPageCapacity)
+			if (!fallbackDescriptorCount)
+				fallbackDescriptorCount = descriptorCount;
+
+			if (heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && fallbackDescriptorCount > defaultSamplerPageCapacity)
 			{
 				outError = "Sampler descriptor allocation exceeds the shader-visible D3D12 sampler-heap limit.";
 				return false;
@@ -162,13 +170,33 @@ namespace ShaderResourceRuntime
 			if (heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
 				pages = &executionSlot->samplerPages;
 			DescriptorHeapPage* selectedPage = nullptr;
+			UINT allocationCount = descriptorCount;
 
-			for (DescriptorHeapPage& page : *pages)
+			//append to the chain's current heap so previously copied tables remain bindable together.
+			if (preferredHeap)
 			{
-				if (page.capacity - page.usedDescriptors >= descriptorCount)
+				for (DescriptorHeapPage& page : *pages)
 				{
-					selectedPage = &page;
-					break;
+					if (page.heap.Get() == preferredHeap && page.capacity - page.usedDescriptors >= descriptorCount)
+					{
+						selectedPage = &page;
+						break;
+					}
+				}
+			}
+
+			if (!selectedPage)
+			{
+				//a heap switch needs room for all active tables, including formerly shared ones.
+				allocationCount = fallbackDescriptorCount;
+
+				for (DescriptorHeapPage& page : *pages)
+				{
+					if (page.capacity - page.usedDescriptors >= allocationCount)
+					{
+						selectedPage = &page;
+						break;
+					}
 				}
 			}
 
@@ -179,7 +207,7 @@ namespace ShaderResourceRuntime
 				UINT pageCapacity = defaultDescriptorPageCapacity;
 				if (heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
 					pageCapacity = defaultSamplerPageCapacity;
-				heapDescription.NumDescriptors = (std::max)(descriptorCount, pageCapacity);
+				heapDescription.NumDescriptors = (std::max)(allocationCount, pageCapacity);
 				heapDescription.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 				DescriptorHeapPage page{};
 				const HRESULT result = device->CreateDescriptorHeap(
@@ -196,18 +224,184 @@ namespace ShaderResourceRuntime
 				}
 
 				page.capacity = heapDescription.NumDescriptors;
+
+				//heap base handles never change; query them once rather than for every pass allocation.
+				page.cpuStart = page.heap->GetCPUDescriptorHandleForHeapStart();
+				page.gpuStart = page.heap->GetGPUDescriptorHandleForHeapStart();
+
 				pages->push_back(std::move(page));
 				selectedPage = &pages->back();
 			}
 
 			const UINT rangeOffset = selectedPage->usedDescriptors;
-			selectedPage->usedDescriptors += descriptorCount;
-			const UINT increment = device->GetDescriptorHandleIncrementSize(heapType);
+			selectedPage->usedDescriptors += allocationCount;
+			UINT increment = commandListSlot.descriptorIncrementSize;
+
+			if (heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+				increment = commandListSlot.samplerDescriptorIncrementSize;
+
 			outAllocation.heap = selectedPage->heap.Get();
-			outAllocation.cpuStart = selectedPage->heap->GetCPUDescriptorHandleForHeapStart();
+			outAllocation.cpuStart = selectedPage->cpuStart;
 			outAllocation.cpuStart.ptr += static_cast<SIZE_T>(rangeOffset) * increment;
-			outAllocation.gpuStart = selectedPage->heap->GetGPUDescriptorHandleForHeapStart();
+			outAllocation.gpuStart = selectedPage->gpuStart;
 			outAllocation.gpuStart.ptr += static_cast<UINT64>(rangeOffset) * increment;
+			outAllocation.descriptorCount = allocationCount;
+			return true;
+		}
+
+		const SamplerOverride* FindSingleSamplerOverride(const std::vector<SamplerOverride>& samplerOverrides, size_t tableIndex)
+		{
+			const SamplerOverride* selectedSampler = nullptr;
+
+			for (const SamplerOverride& candidate : samplerOverrides)
+			{
+				if (candidate.tableIndex != tableIndex)
+					continue;
+
+				//multi-sampler tables still use fresh copies; the common one-sampler case needs no extra key allocation.
+				if (selectedSampler)
+					return nullptr;
+
+				selectedSampler = &candidate;
+			}
+
+			return selectedSampler;
+		}
+
+		bool PrepareChainTables(CommandListSlot& slot, ID3D12Device* device, D3D12_DESCRIPTOR_HEAP_TYPE heapType, ChainDescriptorPool& pool, UINT totalDescriptors, const std::vector<SamplerOverride>& samplerOverrides, std::string& outError)
+		{
+			UINT missingDescriptors = 0;
+
+			for (ActiveTable& table : slot.activeTables)
+			{
+				if (table.heapType != heapType)
+					continue;
+
+				table.needsCopy = true;
+				const SamplerOverride* samplerOverride = nullptr;
+
+				if (heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+					samplerOverride = FindSingleSamplerOverride(samplerOverrides, static_cast<size_t>(&table - slot.activeTables.data()));
+
+				const bool reusableTable = !table.hasOverrides || samplerOverride;
+
+				if (reusableTable)
+					table.sourceVersionKnown = RenderPassResourceRegistry::GetDescriptorContentVersion(table.originalCpu, table.descriptorCount, table.sourceVersion);
+
+				if (reusableTable && table.sourceVersionKnown)
+				{
+					const auto cachedTable = std::find_if(pool.tables.begin(), pool.tables.end(), [&](const ChainDescriptorTable& candidate)
+					{
+						if (candidate.source.ptr != table.originalCpu.ptr || candidate.descriptorCount != table.descriptorCount || candidate.sourceVersion.heapGeneration != table.sourceVersion.heapGeneration || candidate.sourceVersion.revision != table.sourceVersion.revision || candidate.hasSamplerOverride != (samplerOverride != nullptr))
+							return false;
+
+						if (samplerOverride)
+							return candidate.samplerOffset == samplerOverride->tableOffset && std::memcmp(&candidate.samplerDescription, &samplerOverride->description, sizeof(D3D12_SAMPLER_DESC)) == 0;
+
+						return true;
+					});
+
+					if (cachedTable != pool.tables.end())
+					{
+						table.allocation = cachedTable->allocation;
+						table.needsCopy = false;
+					}
+				}
+
+				if (table.needsCopy)
+					missingDescriptors += table.descriptorCount;
+			}
+
+			if (missingDescriptors)
+			{
+				DescriptorAllocation allocation;
+
+				if (!AcquireDescriptorAllocation(slot, device, heapType, missingDescriptors, allocation, outError, pool.heap, totalDescriptors))
+					return false;
+
+				if (allocation.heap != pool.heap)
+				{
+					pool.Reset();
+					pool.heap = allocation.heap;
+
+					//never combine GPU handles from different heaps after a page rollover.
+					for (ActiveTable& table : slot.activeTables)
+						if (table.heapType == heapType)
+							table.needsCopy = true;
+				}
+
+				UINT descriptorIncrement = slot.descriptorIncrementSize;
+
+				if (heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+					descriptorIncrement = slot.samplerDescriptorIncrementSize;
+
+				thread_local std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> copySources;
+				thread_local std::vector<UINT> copySourceSizes;
+				copySources.clear();
+				copySourceSizes.clear();
+				UINT descriptorOffset = 0;
+
+				for (ActiveTable& table : slot.activeTables)
+				{
+					if (table.heapType != heapType || !table.needsCopy)
+						continue;
+
+					table.allocation = allocation;
+					table.allocation.cpuStart.ptr += static_cast<SIZE_T>(descriptorOffset) * descriptorIncrement;
+					table.allocation.gpuStart.ptr += static_cast<UINT64>(descriptorOffset) * descriptorIncrement;
+					table.allocation.descriptorCount = table.descriptorCount;
+					descriptorOffset += table.descriptorCount;
+					copySources.push_back(table.originalCpu);
+					copySourceSizes.push_back(table.descriptorCount);
+				}
+
+				{
+					PerformanceMetrics::ScopedTimer timer(PerformanceMetrics::Timing::CloneShaderResourceTables);
+
+					if (!RenderPassResourceRegistry::CopyDescriptorTables(device, allocation.cpuStart, descriptorOffset, static_cast<UINT>(copySources.size()), copySources.data(), copySourceSizes.data(), heapType))
+					{
+						outError = "Could not copy descriptor tables because an active source mirror is unavailable.";
+						PerformanceMetrics::Increment(PerformanceMetrics::Counter::ShaderResourceTableCopySourceMissing);
+						return false;
+					}
+				}
+
+				PerformanceMetrics::Increment(PerformanceMetrics::Counter::ShaderResourceTableDescriptorsCopied, descriptorOffset);
+				PerformanceMetrics::Increment(PerformanceMetrics::Counter::ShaderResourceCopyBatches);
+			}
+
+			for (const ActiveTable& table : slot.activeTables)
+			{
+				if (table.heapType != heapType)
+					continue;
+
+				if (!table.needsCopy)
+				{
+					PerformanceMetrics::Increment(PerformanceMetrics::Counter::ShaderResourceTablesReused);
+					PerformanceMetrics::Increment(PerformanceMetrics::Counter::ShaderResourceTableDescriptorsReused, table.descriptorCount);
+					continue;
+				}
+
+				if (!table.sourceVersionKnown)
+					continue;
+
+				ChainDescriptorTable cachedTable{table.originalCpu, table.descriptorCount, table.sourceVersion, table.allocation};
+
+				if (table.hasOverrides)
+				{
+					const SamplerOverride* samplerOverride = FindSingleSamplerOverride(samplerOverrides, static_cast<size_t>(&table - slot.activeTables.data()));
+
+					if (!samplerOverride)
+						continue;
+
+					cachedTable.hasSamplerOverride = true;
+					cachedTable.samplerOffset = samplerOverride->tableOffset;
+					cachedTable.samplerDescription = samplerOverride->description;
+				}
+
+				pool.tables.push_back(cachedTable);
+			}
+
 			return true;
 		}
 
@@ -650,7 +844,11 @@ namespace ShaderResourceRuntime
 										  renderPass.inheritedGameBindings.constantBuffers;
 
 		if (!hasDescriptorOverrides && !hasInheritedBindings)
+		{
+			RestoreResourcesImmediately(commandList);
+
 			return true;
+		}
 
 		PerformanceMetrics::Increment(PerformanceMetrics::Counter::ShaderResourceBindAttempted);
 		PerformanceMetrics::ScopedTimer bindTimer(PerformanceMetrics::Timing::BindShaderResources);
@@ -663,6 +861,9 @@ namespace ShaderResourceRuntime
 
 		if (!hasDescriptorOverrides)
 		{
+			//these table handles belong to the game heap, so flush any earlier injector bindings first.
+			RestoreResourcesImmediately(commandList);
+
 			//The game descriptor heap is still active here. Reassert its tables and
 			//root descriptors without allocating or cloning an injector heap.
 			ApplyInheritedRootBindings(
@@ -676,6 +877,14 @@ namespace ShaderResourceRuntime
 		}
 
 		CommandListSlot& slot = GetCommandListSlot(commandList);
+		const bool bindingBatchActive = gResourceBindingBatchCommandList == commandList;
+
+		if (!bindingBatchActive)
+		{
+			slot.resourceTablePool.Reset();
+			slot.samplerTablePool.Reset();
+			slot.boundRootTables.clear();
+		}
 
 		if (!slot.device && FAILED(commandList->GetDevice(IID_PPV_ARGS(&slot.device))))
 		{
@@ -722,6 +931,9 @@ namespace ShaderResourceRuntime
 			slot.layouts.clear();
 			slot.graphicsBindingLocations.clear();
 			slot.computeBindingLocations.clear();
+			slot.resourceTablePool.Reset();
+			slot.samplerTablePool.Reset();
+			slot.boundRootTables.clear();
 
 			if (!RenderPassResourceRegistry::GetDescriptorTableLayouts(
 					gameState.rootSignature,
@@ -794,6 +1006,7 @@ namespace ShaderResourceRuntime
 			table.rootParameterIndex = binding.rootParameterIndex;
 			table.heapType = layoutIt->heapType;
 			table.descriptorCount = descriptorCount;
+			table.canReuseBinding = layoutIt->canReuseBinding;
 			table.originalGpu = {binding.value};
 			table.originalCpu = {sourceHeap->cpuStart.ptr + byteOffset};
 
@@ -811,7 +1024,6 @@ namespace ShaderResourceRuntime
 					return false;
 				}
 
-				table.customOffset = totalDescriptors;
 				totalDescriptors += table.descriptorCount;
 			}
 			else if (table.heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
@@ -828,7 +1040,6 @@ namespace ShaderResourceRuntime
 					return false;
 				}
 
-				table.customOffset = totalSamplerDescriptors;
 				totalSamplerDescriptors += table.descriptorCount;
 			}
 
@@ -853,28 +1064,17 @@ namespace ShaderResourceRuntime
 		if (!slot.samplerDescriptorIncrementSize)
 			slot.samplerDescriptorIncrementSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
 
-		DescriptorAllocation descriptorAllocation{};
-
-		if (requiresResourceHeap && totalDescriptors && !AcquireDescriptorAllocation(slot, device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, totalDescriptors, descriptorAllocation, outError))
-		{
-			return false;
-		}
-
-		DescriptorAllocation samplerAllocation{};
-
-		if (requiresSamplerHeap && totalSamplerDescriptors && !AcquireDescriptorAllocation(slot, device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, totalSamplerDescriptors, samplerAllocation, outError))
-		{
-			return false;
-		}
-
 		const UINT increment = slot.descriptorIncrementSize;
 		const UINT samplerIncrement = slot.samplerDescriptorIncrementSize;
-		const D3D12_CPU_DESCRIPTOR_HANDLE cpuStart = descriptorAllocation.cpuStart;
-		const D3D12_GPU_DESCRIPTOR_HANDLE gpuStart = descriptorAllocation.gpuStart;
-		const D3D12_CPU_DESCRIPTOR_HANDLE samplerCpuStart = samplerAllocation.cpuStart;
-		const D3D12_GPU_DESCRIPTOR_HANDLE samplerGpuStart = samplerAllocation.gpuStart;
 
 		//retain scratch capacity between passes so batching does not introduce per-draw allocations.
+		thread_local std::vector<DescriptorOverride> descriptorOverrides;
+		thread_local std::vector<SamplerOverride> samplerOverrides;
+		descriptorOverrides.clear();
+		samplerOverrides.clear();
+		descriptorOverrides.reserve(renderPass.inputs.size() + renderPass.outputs.size());
+		samplerOverrides.reserve(renderPass.samplers.size());
+
 		thread_local std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> overrideCopyDestinations;
 		thread_local std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> overrideCopySources;
 		overrideCopyDestinations.clear();
@@ -882,73 +1082,11 @@ namespace ShaderResourceRuntime
 		const size_t maximumOverrideCount = renderPass.inputs.size() + renderPass.outputs.size();
 		overrideCopyDestinations.reserve(maximumOverrideCount);
 		overrideCopySources.reserve(maximumOverrideCount);
-		thread_local std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> copySources;
-		thread_local std::vector<UINT> copySourceSizes;
-		const auto copyActiveTables = [&](D3D12_DESCRIPTOR_HEAP_TYPE heapType,
-										  D3D12_CPU_DESCRIPTOR_HANDLE destination,
-										  UINT destinationDescriptorCount) -> bool
-		{
-			if (!destination.ptr || !destinationDescriptorCount)
-				return true;
-
-			copySources.clear();
-			copySourceSizes.clear();
-			copySources.reserve(slot.activeTables.size());
-			copySourceSizes.reserve(slot.activeTables.size());
-
-			for (const ActiveTable& table : slot.activeTables)
-			{
-				if (table.heapType != heapType || !table.descriptorCount)
-					continue;
-
-				copySources.push_back(table.originalCpu);
-				copySourceSizes.push_back(table.descriptorCount);
-			}
-
-			if (!copySources.empty())
-			{
-				{
-					PerformanceMetrics::ScopedTimer timer(PerformanceMetrics::Timing::CloneShaderResourceTables);
-					if (!RenderPassResourceRegistry::CopyDescriptorTables(
-							device,
-							destination,
-							destinationDescriptorCount,
-							static_cast<UINT>(copySources.size()),
-							copySources.data(),
-							copySourceSizes.data(),
-							heapType))
-					{
-						outError = "Could not copy descriptor tables because an active source mirror is unavailable.";
-						PerformanceMetrics::Increment(
-							PerformanceMetrics::Counter::ShaderResourceTableCopySourceMissing);
-						return false;
-					}
-				}
-				PerformanceMetrics::Increment(
-					PerformanceMetrics::Counter::ShaderResourceTableDescriptorsCopied,
-					destinationDescriptorCount);
-				PerformanceMetrics::Increment(PerformanceMetrics::Counter::ShaderResourceCopyBatches);
-			}
-
-			return true;
-		};
-
-		if (descriptorAllocation.heap)
-		{
-			if (!copyActiveTables(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, cpuStart, totalDescriptors))
-				return false;
-		}
-
-		if (samplerAllocation.heap)
-		{
-			if (!copyActiveTables(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, samplerCpuStart, totalSamplerDescriptors))
-				return false;
-		}
-
 		const auto resolveDescriptorDestination = [&](D3D12_DESCRIPTOR_RANGE_TYPE rangeType,
 													  uint32_t shaderRegister,
 													  uint32_t registerSpace,
-													  D3D12_CPU_DESCRIPTOR_HANDLE& outDestination) -> bool
+													  size_t& outTableIndex,
+													  UINT& outTableOffset) -> bool
 		{
 			const bool samplerDescriptor = rangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
 			D3D12_DESCRIPTOR_HEAP_TYPE requiredHeapType = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -1023,18 +1161,9 @@ namespace ShaderResourceRuntime
 				return false;
 			}
 
-			const UINT descriptorOffset = activeTable->customOffset + location->tableOffset;
-			D3D12_CPU_DESCRIPTOR_HANDLE destinationStart = cpuStart;
-			UINT destinationIncrement = increment;
-			if (samplerDescriptor)
-			{
-				destinationStart = samplerCpuStart;
-				destinationIncrement = samplerIncrement;
-			}
-
-			outDestination =
-				{
-					destinationStart.ptr + static_cast<SIZE_T>(descriptorOffset) * destinationIncrement};
+			outTableIndex = static_cast<size_t>(activeTable - slot.activeTables.data());
+			outTableOffset = location->tableOffset;
+			slot.activeTables[outTableIndex].hasOverrides = true;
 
 			return true;
 		};
@@ -1044,34 +1173,33 @@ namespace ShaderResourceRuntime
 										uint32_t registerSpace,
 										D3D12_CPU_DESCRIPTOR_HANDLE sourceDescriptor) -> bool
 		{
-			D3D12_CPU_DESCRIPTOR_HANDLE destination{};
+			size_t tableIndex = 0;
+			UINT tableOffset = 0;
 			if (!resolveDescriptorDestination(
 					rangeType,
 					shaderRegister,
 					registerSpace,
-					destination))
+					tableIndex,
+					tableOffset))
 			{
 				return false;
 			}
 
 			//coalesce duplicate destinations to preserve last-override-wins and avoid overlapping copy ranges.
 			const auto existingDestination = std::find_if(
-				overrideCopyDestinations.begin(),
-				overrideCopyDestinations.end(),
-				[&](const D3D12_CPU_DESCRIPTOR_HANDLE& queuedDestination)
+				descriptorOverrides.begin(),
+				descriptorOverrides.end(),
+				[&](const DescriptorOverride& queuedOverride)
 				{
-					return queuedDestination.ptr == destination.ptr;
+					return queuedOverride.tableIndex == tableIndex && queuedOverride.tableOffset == tableOffset;
 				});
-			if (existingDestination != overrideCopyDestinations.end())
+			if (existingDestination != descriptorOverrides.end())
 			{
-				const size_t destinationIndex = static_cast<size_t>(
-					existingDestination - overrideCopyDestinations.begin());
-				overrideCopySources[destinationIndex] = sourceDescriptor;
+				existingDestination->source = sourceDescriptor;
 				return true;
 			}
 
-			overrideCopyDestinations.push_back(destination);
-			overrideCopySources.push_back(sourceDescriptor);
+			descriptorOverrides.push_back({tableIndex, tableOffset, sourceDescriptor});
 			return true;
 		};
 
@@ -1185,13 +1313,15 @@ namespace ShaderResourceRuntime
 
 		for (const RenderPass::SamplerStateDisk& sampler : renderPass.samplers)
 		{
-			D3D12_CPU_DESCRIPTOR_HANDLE destination{};
+			size_t tableIndex = 0;
+			UINT tableOffset = 0;
 
 			if (!resolveDescriptorDestination(
 					D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER,
 					sampler.shaderRegister,
 					sampler.registerSpace,
-					destination))
+					tableIndex,
+					tableOffset))
 			{
 				return false;
 			}
@@ -1207,7 +1337,37 @@ namespace ShaderResourceRuntime
 			std::copy(sampler.borderColor.begin(), sampler.borderColor.end(), description.BorderColor);
 			description.MinLOD = sampler.minimumLod;
 			description.MaxLOD = (std::max)(sampler.minimumLod, sampler.maximumLod);
-			device->CreateSampler(&description, destination);
+			const auto existingSampler = std::find_if(samplerOverrides.begin(), samplerOverrides.end(), [&](const SamplerOverride& candidate) { return candidate.tableIndex == tableIndex && candidate.tableOffset == tableOffset; });
+
+			if (existingSampler == samplerOverrides.end())
+				samplerOverrides.push_back({tableIndex, tableOffset, description});
+			else
+				existingSampler->description = description;
+		}
+
+		if (requiresResourceHeap && !PrepareChainTables(slot, device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, slot.resourceTablePool, totalDescriptors, samplerOverrides, outError))
+			return false;
+
+		if (requiresSamplerHeap && !PrepareChainTables(slot, device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, slot.samplerTablePool, totalSamplerDescriptors, samplerOverrides, outError))
+			return false;
+
+		for (const SamplerOverride& samplerOverride : samplerOverrides)
+		{
+			//cached sampler tables are immutable, even if rewriting the same bytes would look harmless.
+			if (!slot.activeTables[samplerOverride.tableIndex].needsCopy)
+				continue;
+
+			D3D12_CPU_DESCRIPTOR_HANDLE destination = slot.activeTables[samplerOverride.tableIndex].allocation.cpuStart;
+			destination.ptr += static_cast<SIZE_T>(samplerOverride.tableOffset) * samplerIncrement;
+			device->CreateSampler(&samplerOverride.description, destination);
+		}
+
+		for (const DescriptorOverride& descriptorOverride : descriptorOverrides)
+		{
+			D3D12_CPU_DESCRIPTOR_HANDLE destination = slot.activeTables[descriptorOverride.tableIndex].allocation.cpuStart;
+			destination.ptr += static_cast<SIZE_T>(descriptorOverride.tableOffset) * increment;
+			overrideCopyDestinations.push_back(destination);
+			overrideCopySources.push_back(descriptorOverride.source);
 		}
 
 		if (!overrideCopyDestinations.empty())
@@ -1242,10 +1402,10 @@ namespace ShaderResourceRuntime
 
 		ID3D12DescriptorHeap* resourceHeap = originalResourceHeap;
 		ID3D12DescriptorHeap* samplerHeap = originalSamplerHeap;
-		if (descriptorAllocation.heap)
-			resourceHeap = descriptorAllocation.heap;
-		if (samplerAllocation.heap)
-			samplerHeap = samplerAllocation.heap;
+		if (requiresResourceHeap)
+			resourceHeap = slot.resourceTablePool.heap;
+		if (requiresSamplerHeap)
+			samplerHeap = slot.samplerTablePool.heap;
 
 		std::array<ID3D12DescriptorHeap*, 2> heaps{};
 
@@ -1260,29 +1420,52 @@ namespace ShaderResourceRuntime
 		ID3D12DescriptorHeap* const* heapData = nullptr;
 		if (heapCount)
 			heapData = heaps.data();
-		commandList->SetDescriptorHeaps(heapCount, heapData);
+		const bool heapsUnchanged = bindingBatchActive && slot.boundDescriptorHeapsKnown && slot.boundDescriptorHeapCount == heapCount && std::equal(heaps.begin(), heaps.begin() + heapCount, slot.boundDescriptorHeaps.begin());
+
+		if (heapsUnchanged)
+			PerformanceMetrics::Increment(PerformanceMetrics::Counter::ShaderResourceHeapBindAvoided);
+		else
+		{
+			commandList->SetDescriptorHeaps(heapCount, heapData);
+			slot.boundRootTables.clear();
+
+			PerformanceMetrics::Increment(PerformanceMetrics::Counter::ShaderResourceHeapBind);
+		}
+
+		slot.boundDescriptorHeaps = heaps;
+
+		slot.boundDescriptorHeapCount = heapCount;
+
+		slot.boundDescriptorHeapsKnown = bindingBatchActive;
 
 		for (const ActiveTable& table : slot.activeTables)
 		{
 			D3D12_GPU_DESCRIPTOR_HANDLE handle = table.originalGpu;
 
-			if (table.heapType == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && descriptorAllocation.heap)
+			if (table.allocation.heap)
+				handle = table.allocation.gpuStart;
+
+			const auto previousBinding = std::find_if(slot.boundRootTables.begin(), slot.boundRootTables.end(), [&](const RootTableRestore& binding)
 			{
-				handle =
-					{
-						gpuStart.ptr + static_cast<UINT64>(table.customOffset) * increment};
-			}
-			else if (table.heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && samplerAllocation.heap)
+				return binding.rootParameterIndex == table.rootParameterIndex && binding.computePipeline == computePipeline;
+			});
+
+			//static-data ranges need their binding point reasserted even when the descriptor bytes are shared.
+			if (table.canReuseBinding && heapsUnchanged && previousBinding != slot.boundRootTables.end() && previousBinding->descriptorHandle.ptr == handle.ptr)
 			{
-				handle =
-					{
-						samplerGpuStart.ptr + static_cast<UINT64>(table.customOffset) * samplerIncrement};
+				PerformanceMetrics::Increment(PerformanceMetrics::Counter::ShaderResourceRootTableBindAvoided);
+				continue;
 			}
 
 			if (computePipeline)
 				commandList->SetComputeRootDescriptorTable(table.rootParameterIndex, handle);
 			else
 				commandList->SetGraphicsRootDescriptorTable(table.rootParameterIndex, handle);
+
+			if (previousBinding == slot.boundRootTables.end())
+				slot.boundRootTables.push_back({table.rootParameterIndex, handle, computePipeline});
+			else
+				previousBinding->descriptorHandle = handle;
 		}
 
 		ApplyInheritedRootBindings(
@@ -1322,11 +1505,65 @@ namespace ShaderResourceRuntime
 		return true;
 	}
 
+	ScopedResourceBindingBatch::ScopedResourceBindingBatch(ID3D12GraphicsCommandList* commandList)
+		: commandList(commandList), previousCommandList(gResourceBindingBatchCommandList)
+	{
+		gResourceBindingBatchCommandList = commandList;
+
+		if (CommandListSlot* slot = FindCommandListSlot(commandList))
+		{
+			slot->resourceTablePool.Reset();
+			slot->samplerTablePool.Reset();
+			slot->boundRootTables.clear();
+		}
+	}
+
+	ScopedResourceBindingBatch::~ScopedResourceBindingBatch()
+	{
+		gResourceBindingBatchCommandList = previousCommandList;
+
+		if (!keepResourcesForOriginalDraw)
+		{
+			HookD3D12::ScopedRenderPassInjection injectionScope;
+
+			RestoreResourcesImmediately(commandList);
+		}
+	}
+
+	void ScopedResourceBindingBatch::KeepResourcesForOriginalDraw()
+	{
+		keepResourcesForOriginalDraw = true;
+	}
+
 	void RestoreResources(ID3D12GraphicsCommandList* commandList)
+	{
+		if (gResourceBindingBatchCommandList == commandList)
+		{
+			CommandListSlot* slot = FindCommandListSlot(commandList);
+
+			if (slot && slot->pendingRestore)
+				PerformanceMetrics::Increment(PerformanceMetrics::Counter::ShaderResourceRestoreDeferred);
+
+			return;
+		}
+
+		RestoreResourcesImmediately(commandList);
+	}
+
+	void RestoreResourcesImmediately(ID3D12GraphicsCommandList* commandList)
 	{
 		CommandListSlot* slot = FindCommandListSlot(commandList);
 
-		if (!slot || !slot->pendingRestore)
+		if (!slot)
+			return;
+
+		//a mip generator or a pass using native game bindings can change heaps outside this batch.
+		slot->boundDescriptorHeapsKnown = false;
+		slot->resourceTablePool.Reset();
+		slot->samplerTablePool.Reset();
+		slot->boundRootTables.clear();
+
+		if (!slot->pendingRestore)
 			return;
 
 		PerformanceMetrics::ScopedTimer restoreTimer(PerformanceMetrics::Timing::RestoreShaderResources);
@@ -1335,6 +1572,8 @@ namespace ShaderResourceRuntime
 		if (!slot->restoreHeaps.empty())
 			restoreHeapData = slot->restoreHeaps.data();
 		commandList->SetDescriptorHeaps(static_cast<UINT>(slot->restoreHeaps.size()), restoreHeapData);
+
+		PerformanceMetrics::Increment(PerformanceMetrics::Counter::ShaderResourceHeapRestore);
 
 		RestoreRootTables(commandList, *slot);
 		slot->pendingRestore = false;
@@ -1358,6 +1597,10 @@ namespace ShaderResourceRuntime
 
 		CommandListSlot& commandListSlot = *slotIt->second;
 		commandListSlot.pendingRestore = false;
+		commandListSlot.boundDescriptorHeapsKnown = false;
+		commandListSlot.resourceTablePool.Reset();
+		commandListSlot.samplerTablePool.Reset();
+		commandListSlot.boundRootTables.clear();
 
 		for (DescriptorExecutionSlot* executionSlot : commandListSlot.recordedExecutionSlots)
 		{
@@ -1474,6 +1717,7 @@ namespace ShaderResourceRuntime
 
 		gCachedCommandList = nullptr;
 		gCachedCommandListSlot = nullptr;
+		gResourceBindingBatchCommandList = nullptr;
 	}
 
 	void LogPerformanceStatistics()

@@ -27,6 +27,8 @@ namespace ShaderResourceRuntime
 		std::string& outError,
 		const RuntimeTextureBindingOverride* runtimeTextureOverride = nullptr);
 	void RestoreResources(ID3D12GraphicsCommandList* commandList);
+	//flush before another subsystem changes descriptor heaps, even while a graph batch is active.
+	void RestoreResourcesImmediately(ID3D12GraphicsCommandList* commandList);
 	bool HasRecordedCommandListWork();
 	void ResetCommandList(ID3D12GraphicsCommandList* commandList);
 	void NotifyCommandListsSubmitted(

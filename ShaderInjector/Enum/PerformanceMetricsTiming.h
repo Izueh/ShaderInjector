@@ -34,6 +34,8 @@ namespace PerformanceMetrics
 		ApplyShaderResourceOverrides,
 		UpdateDescriptorMirrors,
 		ResolveDescriptorMirrorTables,
+		PrepareDescriptorCopyBatch,
+		CopyDescriptorBatchMetadata,
 		Count,
 	};
 } //namespace PerformanceMetrics

@@ -10,9 +10,11 @@
 #include "RenderPass/RenderPassMipChain.h"
 #include "RenderPass/RenderTargetState.h"
 #include "RenderPass/ExecutorThreadPipelineLookup.h"
+#include "RenderPass/ExecutorEventNameLookup.h"
 #include "RenderPass/RenderPassReplacement.h"
 #include "RenderPass/RenderPassTexturePool.h"
 #include "ShaderResource/Runtime/ShaderResourceRuntime.h"
+#include "Performance/RenderPassGPUProfiler.h"
 #include "Globals.h"
 #include "RenderDoc/RenderDocIntegration.h"
 #include "IO/ShaderInjectorIO.h"
@@ -28,8 +30,9 @@ namespace RenderPassExecutor
 
 	thread_local std::array<ThreadPipelineLookup, 16> gThreadPipelineLookups;
 	thread_local size_t gNextThreadPipelineLookup = 0;
-	thread_local const RenderPass::RenderPassDisk* gEventNameRenderPass = nullptr;
-	thread_local std::wstring gEventName;
+	thread_local std::unordered_map<const RenderPass::RenderPassDisk*, ExecutorEventNameLookup> gEventNameLookups;
+	thread_local std::vector<D3D12_RESOURCE_BARRIER> gComputeTransitions;
+	thread_local std::vector<D3D12_RESOURCE_BARRIER> gComputeCompletionBarriers;
 
 	bool RenderTargetStatesEqual(const RenderTargetState& left, const RenderTargetState& right)
 	{
@@ -68,12 +71,13 @@ namespace RenderPassExecutor
 
 	const std::wstring& GetRenderPassEventName(const RenderPass::RenderPassDisk& renderPass)
 	{
-		if (gEventNameRenderPass != &renderPass)
+		ExecutorEventNameLookup& lookup = gEventNameLookups[&renderPass];
+		if (lookup.eventName.empty() || lookup.renderPassName != renderPass.name)
 		{
-			gEventNameRenderPass = &renderPass;
-			gEventName = StringHelper::Utf8ToWide("Shader Injector Render Pass: " + renderPass.name);
+			lookup.renderPassName = renderPass.name;
+			lookup.eventName = StringHelper::Utf8ToWide("Shader Injector Render Pass: " + renderPass.name);
 		}
-		return gEventName;
+		return lookup.eventName;
 	}
 
 	bool BuildRenderTargetState(
@@ -457,6 +461,8 @@ namespace RenderPassExecutor
 		std::string& outError)
 	{
 		outError.clear();
+		gComputeTransitions.clear();
+		gComputeCompletionBarriers.clear();
 
 		if (!commandList || !computePipelineState || !pipelineStateToRestore)
 		{
@@ -476,16 +482,19 @@ namespace RenderPassExecutor
 			return false;
 		}
 
-		std::vector<D3D12_RESOURCE_BARRIER> transitions;
-		transitions.reserve(unorderedAccessOutputs.size());
+		gComputeTransitions.reserve(unorderedAccessOutputs.size());
 
 		for (const RenderPassTexturePool::TextureView& output : unorderedAccessOutputs)
 		{
 			if (!output.resource || !output.unorderedAccessView.ptr)
 			{
+				gComputeTransitions.clear();
 				outError = "A compute output is missing its texture or UAV descriptor.";
 				return false;
 			}
+			//same-state UAV outputs have no transition; their ordering stays after the dispatch.
+			if (output.initialState == D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+				continue;
 
 			D3D12_RESOURCE_BARRIER barrier{};
 			barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -493,7 +502,7 @@ namespace RenderPassExecutor
 			barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 			barrier.Transition.StateBefore = output.initialState;
 			barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-			transitions.push_back(barrier);
+			gComputeTransitions.push_back(barrier);
 		}
 
 		const std::wstring& eventName = GetRenderPassEventName(renderPass);
@@ -504,8 +513,8 @@ namespace RenderPassExecutor
 				eventName.c_str(),
 				static_cast<UINT>((eventName.size() + 1) * sizeof(wchar_t)));
 
-			if (!transitions.empty())
-				commandList->ResourceBarrier(static_cast<UINT>(transitions.size()), transitions.data());
+			if (!gComputeTransitions.empty())
+				commandList->ResourceBarrier(static_cast<UINT>(gComputeTransitions.size()), gComputeTransitions.data());
 
 			commandList->SetPipelineState(computePipelineState);
 			HookD3D12::Original_Dispatch(
@@ -514,22 +523,33 @@ namespace RenderPassExecutor
 				threadGroupCountY,
 				threadGroupCountZ);
 
-			if (!transitions.empty())
+			if (!unorderedAccessOutputs.empty())
 			{
-				std::vector<D3D12_RESOURCE_BARRIER> completionBarriers;
-				completionBarriers.reserve(transitions.size() * 2);
+				gComputeCompletionBarriers.reserve(unorderedAccessOutputs.size());
 
-				for (D3D12_RESOURCE_BARRIER& transition : transitions)
+				for (const RenderPassTexturePool::TextureView& output : unorderedAccessOutputs)
 				{
-					D3D12_RESOURCE_BARRIER unorderedAccessBarrier{};
-					unorderedAccessBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-					unorderedAccessBarrier.UAV.pResource = transition.Transition.pResource;
-					completionBarriers.push_back(unorderedAccessBarrier);
-					std::swap(transition.Transition.StateBefore, transition.Transition.StateAfter);
-					completionBarriers.push_back(transition);
+					if (output.initialState == D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+					{
+						//this output stays in UAV state, so retain ordering for its next same-state access.
+						D3D12_RESOURCE_BARRIER unorderedAccessBarrier{};
+						unorderedAccessBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+						unorderedAccessBarrier.UAV.pResource = output.resource.Get();
+						gComputeCompletionBarriers.push_back(unorderedAccessBarrier);
+						continue;
+					}
+
+					//the UAV-to-output-state transition orders prior writes, so a separate UAV barrier is redundant.
+					D3D12_RESOURCE_BARRIER transition{};
+					transition.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+					transition.Transition.pResource = output.resource.Get();
+					transition.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+					transition.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+					transition.Transition.StateAfter = output.initialState;
+					gComputeCompletionBarriers.push_back(transition);
 				}
 
-				commandList->ResourceBarrier(static_cast<UINT>(completionBarriers.size()), completionBarriers.data());
+				commandList->ResourceBarrier(static_cast<UINT>(gComputeCompletionBarriers.size()), gComputeCompletionBarriers.data());
 			}
 
 			commandList->SetPipelineState(pipelineStateToRestore);
@@ -571,32 +591,36 @@ namespace RenderPassExecutor
 		}
 
 		std::array<D3D12_RESOURCE_BARRIER, 2> barriers{};
-		barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		barriers[0].Transition.pResource = source.resource.Get();
-		barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-		barriers[0].Transition.StateBefore = source.initialState;
-		barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-		barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		barriers[1].Transition.pResource = destination.resource.Get();
-		barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-		barriers[1].Transition.StateBefore = destination.initialState;
-		barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+		UINT barrierCount = 0;
+		if (source.initialState != D3D12_RESOURCE_STATE_COPY_SOURCE)
+		{
+			D3D12_RESOURCE_BARRIER& sourceBarrier = barriers[barrierCount++];
+			sourceBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			sourceBarrier.Transition.pResource = source.resource.Get();
+			sourceBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			sourceBarrier.Transition.StateBefore = source.initialState;
+			sourceBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+		}
+		if (destination.initialState != D3D12_RESOURCE_STATE_COPY_DEST)
+		{
+			D3D12_RESOURCE_BARRIER& destinationBarrier = barriers[barrierCount++];
+			destinationBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			destinationBarrier.Transition.pResource = destination.resource.Get();
+			destinationBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			destinationBarrier.Transition.StateBefore = destination.initialState;
+			destinationBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+		}
 		{
 			HookD3D12::ScopedRenderPassInjection injectionScope;
 
-			if (source.initialState == D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
-			{
-				D3D12_RESOURCE_BARRIER unorderedAccessBarrier{};
-				unorderedAccessBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-				unorderedAccessBarrier.UAV.pResource = source.resource.Get();
-				commandList->ResourceBarrier(1, &unorderedAccessBarrier);
-			}
-
-			commandList->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+			//the transition to COPY_SOURCE orders earlier UAV writes before the copy.
+			if (barrierCount)
+				commandList->ResourceBarrier(barrierCount, barriers.data());
 			commandList->CopyResource(destination.resource.Get(), source.resource.Get());
-			std::swap(barriers[0].Transition.StateBefore, barriers[0].Transition.StateAfter);
-			std::swap(barriers[1].Transition.StateBefore, barriers[1].Transition.StateAfter);
-			commandList->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+			for (UINT barrierIndex = 0; barrierIndex < barrierCount; ++barrierIndex)
+				std::swap(barriers[barrierIndex].Transition.StateBefore, barriers[barrierIndex].Transition.StateAfter);
+			if (barrierCount)
+				commandList->ResourceBarrier(barrierCount, barriers.data());
 		}
 
 		return true;
@@ -608,6 +632,7 @@ namespace RenderPassExecutor
 		RenderPassReplacement::ReleaseResources();
 		RenderPassTexturePool::ReleaseResources();
 		ShaderResourceRuntime::ReleaseResources();
+		RenderPassGPUProfiler::ReleaseResources();
 		std::lock_guard<std::mutex> cacheLock(gPipelineCacheMutex);
 
 		for (auto& cachedPipeline : gPipelineCache)
@@ -620,7 +645,6 @@ namespace RenderPassExecutor
 		gPipelineCreationErrors.clear();
 		gThreadPipelineLookups = {};
 		gNextThreadPipelineLookup = 0;
-		gEventNameRenderPass = nullptr;
-		gEventName.clear();
+		gEventNameLookups.clear();
 	}
 } //namespace RenderPassExecutor

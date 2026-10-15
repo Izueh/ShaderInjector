@@ -10,5 +10,6 @@ namespace ShaderResourceRuntime
 		ID3D12DescriptorHeap* heap = nullptr;
 		D3D12_CPU_DESCRIPTOR_HANDLE cpuStart{};
 		D3D12_GPU_DESCRIPTOR_HANDLE gpuStart{};
+		UINT descriptorCount = 0;
 	};
 } //namespace ShaderResourceRuntime

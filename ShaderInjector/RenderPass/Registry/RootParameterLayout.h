@@ -15,6 +15,7 @@ namespace RenderPassResourceRegistry
 		D3D12_SHADER_VISIBILITY shaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		UINT shaderRegister = UINT32_MAX;
 		UINT registerSpace = UINT32_MAX;
+		bool canReuseBinding = false;
 		std::vector<DescriptorRangeLayout> ranges;
 	};
 } //namespace RenderPassResourceRegistry

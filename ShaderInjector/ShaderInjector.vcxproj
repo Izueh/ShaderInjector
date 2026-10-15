@@ -257,6 +257,13 @@
     <ClInclude Include="ModifiedShader\ModifiedShaderCreation.h" />
     <ClInclude Include="ModifiedShader\ModifiedShaderRecapture.h" />
     <ClInclude Include="Performance\PerformanceMetrics.h" />
+    <ClInclude Include="Performance\GPUTimingCommandList.h" />
+    <ClInclude Include="Performance\GPUTimingPage.h" />
+    <ClInclude Include="Performance\GPUTimingQueue.h" />
+    <ClInclude Include="Performance\GPUTimingSample.h" />
+    <ClInclude Include="Performance\GPUTimingStatistics.h" />
+    <ClInclude Include="Performance\GPUTimingToken.h" />
+    <ClInclude Include="Performance\RenderPassGPUProfiler.h" />
     <ClInclude Include="Performance\ThreadMetrics.h" />
     <ClInclude Include="Performance\TimingAccumulator.h" />
     <ClInclude Include="Performance\TimingSnapshot.h" />
@@ -264,6 +271,7 @@
     <ClInclude Include="RenderPass\DatabaseRenderPasses.h" />
     <ClInclude Include="RenderPass\RenderPass.h" />
     <ClInclude Include="RenderPass\RenderPassExecutor.h" />
+    <ClInclude Include="RenderPass\ExecutorEventNameLookup.h" />
     <ClInclude Include="RenderPass\RenderPassGraph.h" />
     <ClInclude Include="RenderPass\RenderPassMipChain.h" />
     <ClInclude Include="RenderPass\RecordedTextureState.h" />
@@ -305,6 +313,9 @@
     <ClInclude Include="RenderPass\Registry\DescriptorHeapRecord.h" />
     <ClInclude Include="RenderPass\Registry\DescriptorHeapLookupCache.h" />
     <ClInclude Include="RenderPass\Registry\DescriptorCopySegment.h" />
+    <ClInclude Include="RenderPass\Registry\DescriptorCopyBatchSpan.h" />
+    <ClInclude Include="RenderPass\Registry\DescriptorCopyBatch.h" />
+    <ClInclude Include="RenderPass\Registry\DescriptorContentVersion.h" />
     <ClInclude Include="RenderPass\MipChain\DeviceResources.h" />
     <ClInclude Include="RenderPass\MipChain\MipTextureResources.h" />
     <ClInclude Include="RenderPass\MipChain\ExecutionSlot.h" />
@@ -387,10 +398,15 @@
     <ClInclude Include="ShaderResource\Runtime\TextureGPU.h" />
     <ClInclude Include="ShaderResource\Runtime\RootTableRestore.h" />
     <ClInclude Include="ShaderResource\Runtime\ActiveTable.h" />
+    <ClInclude Include="ShaderResource\Runtime\ChainDescriptorTable.h" />
+    <ClInclude Include="ShaderResource\Runtime\ChainDescriptorPool.h" />
+    <ClInclude Include="ShaderResource\Runtime\DescriptorOverride.h" />
+    <ClInclude Include="ShaderResource\Runtime\SamplerOverride.h" />
     <ClInclude Include="ShaderResource\Runtime\DescriptorHeapPage.h" />
     <ClInclude Include="ShaderResource\Runtime\DescriptorExecutionSlot.h" />
     <ClInclude Include="ShaderResource\Runtime\DescriptorAllocation.h" />
     <ClInclude Include="ShaderResource\Runtime\CommandListSlot.h" />
+    <ClInclude Include="ShaderResource\Runtime\ScopedResourceBindingBatch.h" />
     <ClInclude Include="ShaderResource\Runtime\QueueFence.h" />
     <ClInclude Include="ShaderConfiguration\DatabaseShaderConfigurations.h" />
     <ClInclude Include="ShaderConfiguration\ShaderConfiguration.h" />
@@ -542,6 +558,7 @@
     <ClCompile Include="ModifiedShader\ModifiedShaderCreation.cpp" />
     <ClCompile Include="ModifiedShader\ModifiedShaderRecapture.cpp" />
     <ClCompile Include="Performance\PerformanceMetrics.cpp" />
+    <ClCompile Include="Performance\RenderPassGPUProfiler.cpp" />
     <ClCompile Include="RenderDoc\RenderDocIntegration.cpp" />
     <ClCompile Include="RenderPass\DatabaseRenderPasses.cpp" />
     <ClCompile Include="RenderPass\RenderPass.cpp" />

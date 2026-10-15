@@ -9,6 +9,8 @@ namespace ShaderResourceRuntime
 	struct DescriptorHeapPage
 	{
 		Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;
+		D3D12_CPU_DESCRIPTOR_HANDLE cpuStart{};
+		D3D12_GPU_DESCRIPTOR_HANDLE gpuStart{};
 		UINT capacity = 0;
 		UINT usedDescriptors = 0;
 	};

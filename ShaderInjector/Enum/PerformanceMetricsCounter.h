@@ -39,6 +39,16 @@ namespace PerformanceMetrics
 		DescriptorMirrorCreationFailed,
 		DescriptorMirrorDescriptorsWritten,
 		DescriptorMirrorSourceMissing,
+		DescriptorCopyBatched,
+		DescriptorCopyBatchedDescriptors,
+		DescriptorCopyContiguousRangesBatched,
+		ShaderResourceHeapBind,
+		ShaderResourceHeapBindAvoided,
+		ShaderResourceHeapRestore,
+		ShaderResourceRestoreDeferred,
+		ShaderResourceTablesReused,
+		ShaderResourceTableDescriptorsReused,
+		ShaderResourceRootTableBindAvoided,
 		Count,
 	};
 } //namespace PerformanceMetrics

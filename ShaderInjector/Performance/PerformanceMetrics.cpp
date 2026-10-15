@@ -103,6 +103,16 @@ namespace PerformanceMetrics
 			"descriptorMirrorCreationFailed",
 			"descriptorMirrorDescriptorsWritten",
 			"descriptorMirrorSourceMissing",
+			"descriptorCopyBatched",
+			"descriptorCopyBatchedDescriptors",
+			"descriptorCopyContiguousRangesBatched",
+			"shaderResourceHeapBind",
+			"shaderResourceHeapBindAvoided",
+			"shaderResourceHeapRestore",
+			"shaderResourceRestoreDeferred",
+			"shaderResourceTablesReused",
+			"shaderResourceTableDescriptorsReused",
+			"shaderResourceRootTableBindAvoided",
 		};
 
 		//keep telemetry labels aligned when a new counter is added to the enum.
@@ -143,6 +153,8 @@ namespace PerformanceMetrics
 			"applyShaderResourceOverrides",
 			"updateDescriptorMirrors",
 			"resolveDescriptorMirrorTables",
+			"prepareDescriptorCopyBatch",
+			"copyDescriptorBatchMetadata",
 		};
 
 		static_assert(sizeof(names) / sizeof(names[0]) == timingCount);

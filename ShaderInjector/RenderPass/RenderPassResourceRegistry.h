@@ -11,6 +11,7 @@
 #include "RenderPass/Registry/RegistryStatistics.h"
 #include "RenderPass/Registry/DescriptorTableLayout.h"
 #include "RenderPass/Registry/DescriptorBindingLocation.h"
+#include "RenderPass/Registry/DescriptorContentVersion.h"
 
 namespace RenderPassResourceRegistry
 {
@@ -56,6 +57,8 @@ namespace RenderPassResourceRegistry
 
 	//clone complete tables from CPU-only mirrors, retaining owners and read locks through the native copy.
 	bool CopyDescriptorTables(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE destination, UINT destinationDescriptorCount, UINT sourceRangeCount, const D3D12_CPU_DESCRIPTOR_HANDLE* originalSources, const UINT* sourceSizes, D3D12_DESCRIPTOR_HEAP_TYPE heapType);
+	//this identifies observed descriptor writes, not changes to the texture or buffer contents themselves.
+	bool GetDescriptorContentVersion(D3D12_CPU_DESCRIPTOR_HANDLE source, UINT descriptorCount, DescriptorContentVersion& outVersion);
 
 	bool CopyDescriptors(
 		UINT destinationRangeCount,

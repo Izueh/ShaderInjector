@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 
 #include <d3d12.h>
@@ -19,6 +20,8 @@ namespace RenderPassResourceRegistry
 		SIZE_T end = 0;
 		UINT descriptorCount = 0;
 		UINT descriptorIncrementSize = 0;
+		uint64_t heapGeneration = 0;
+		std::atomic<uint64_t> contentRevision{0};
 		D3D12_DESCRIPTOR_HEAP_TYPE type = D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES;
 		bool shaderVisible = false;
 		//only a heap captured at creation can prove that unwritten slots were originally empty.

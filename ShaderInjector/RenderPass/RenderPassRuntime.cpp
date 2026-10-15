@@ -21,6 +21,7 @@
 #include "GUI/ShaderInjectorGUI.h"
 #include "Globals.h"
 #include "Performance/PerformanceMetrics.h"
+#include "Performance/RenderPassGPUProfiler.h"
 #include "RenderPass/RenderPassResourceRegistry.h"
 #include "RenderPass/RenderPassExecutor.h"
 #include "RenderPass/RenderPassGraph.h"
@@ -39,6 +40,7 @@
 #include "RenderPass/Runtime/ThreadGameTextureBindingLookup.h"
 #include "ShaderResource/ShaderResourceCatalog.h"
 #include "ShaderResource/Runtime/ShaderResourceRuntime.h"
+#include "ShaderResource/Runtime/ScopedResourceBindingBatch.h"
 #include "IO/ShaderInjectorIO.h"
 #include "StringHelper.h"
 
@@ -1412,7 +1414,8 @@ namespace RenderPassRuntime
 	{
 		return RenderPassTexturePool::HasRecordedCommandListWork() ||
 			   RenderPassMipChain::HasRecordedCommandListWork() ||
-			   ShaderResourceRuntime::HasRecordedCommandListWork();
+			   ShaderResourceRuntime::HasRecordedCommandListWork() ||
+			   RenderPassGPUProfiler::HasRecordedCommandListWork();
 	}
 
 	bool IsExecutionTrackingRequired(bool computePipeline, ExecutionBoundary boundary)
@@ -1571,6 +1574,7 @@ namespace RenderPassRuntime
 			RenderPassTexturePool::ResetCommandListRecording(commandList);
 			RenderPassMipChain::ResetCommandListRecording(commandList);
 			ShaderResourceRuntime::ResetCommandList(commandList);
+			RenderPassGPUProfiler::ResetCommandList(commandList);
 		}
 	}
 
@@ -1789,12 +1793,33 @@ namespace RenderPassRuntime
 			return;
 
 		CommandListRenderState& state = GetCommandListState(commandList);
-		state.inputBindings.erase(
-			std::remove_if(state.inputBindings.begin(), state.inputBindings.end(), [](const auto& binding)
-						   { return binding.bindingType == "Index Buffer"; }),
-			state.inputBindings.end());
+		auto bindingIterator = std::find_if(
+			state.inputBindings.begin(),
+			state.inputBindings.end(),
+			[](const auto& binding)
+			{ return binding.bindingType == "Index Buffer"; });
 		if (!view || !view->BufferLocation)
+		{
+			if (bindingIterator != state.inputBindings.end())
+				state.inputBindings.erase(bindingIterator);
 			return;
+		}
+
+		if (bindingIterator != state.inputBindings.end())
+		{
+			const bool bindingUnchanged = bindingIterator->pipeline == "Graphics" &&
+								  bindingIterator->gpuAddress == view->BufferLocation &&
+								  bindingIterator->bufferSize == view->SizeInBytes &&
+								  bindingIterator->resourceFormat == static_cast<uint32_t>(view->Format);
+			if (bindingUnchanged)
+				return;
+
+			bindingIterator->pipeline = "Graphics";
+			bindingIterator->gpuAddress = view->BufferLocation;
+			bindingIterator->bufferSize = view->SizeInBytes;
+			bindingIterator->resourceFormat = static_cast<uint32_t>(view->Format);
+			return;
+		}
 
 		RenderPass::ResourceBindingDiagnostic binding{};
 		binding.pipeline = "Graphics";
@@ -1816,25 +1841,53 @@ namespace RenderPassRuntime
 
 		CommandListRenderState& state = GetCommandListState(commandList);
 		const uint64_t endSlot = static_cast<uint64_t>(startSlot) + viewCount;
-		state.inputBindings.erase(
-			std::remove_if(state.inputBindings.begin(), state.inputBindings.end(), [startSlot, endSlot](const auto& binding)
-						   { return binding.bindingType == "Vertex Buffer" &&
+		if (!views)
+		{
+			state.inputBindings.erase(
+				std::remove_if(state.inputBindings.begin(), state.inputBindings.end(), [startSlot, endSlot](const auto& binding)
+							   { return binding.bindingType == "Vertex Buffer" &&
 									binding.shaderRegister >= startSlot &&
 									binding.shaderRegister < endSlot; }),
-			state.inputBindings.end());
-
-		if (!views)
+				state.inputBindings.end());
 			return;
+		}
 		for (UINT viewIndex = 0; viewIndex < viewCount; ++viewIndex)
 		{
 			const D3D12_VERTEX_BUFFER_VIEW& view = views[viewIndex];
+			const UINT slot = startSlot + viewIndex;
+			auto bindingIterator = std::find_if(
+				state.inputBindings.begin(),
+				state.inputBindings.end(),
+				[slot](const auto& binding)
+				{ return binding.bindingType == "Vertex Buffer" && binding.shaderRegister == slot; });
+
 			if (!view.BufferLocation)
+			{
+				if (bindingIterator != state.inputBindings.end())
+					state.inputBindings.erase(bindingIterator);
 				continue;
+			}
+
+			if (bindingIterator != state.inputBindings.end())
+			{
+				const bool bindingUnchanged = bindingIterator->pipeline == "Graphics" &&
+								  bindingIterator->gpuAddress == view.BufferLocation &&
+								  bindingIterator->bufferSize == view.SizeInBytes &&
+								  bindingIterator->structureByteStride == view.StrideInBytes;
+				if (bindingUnchanged)
+					continue;
+
+				bindingIterator->pipeline = "Graphics";
+				bindingIterator->gpuAddress = view.BufferLocation;
+				bindingIterator->bufferSize = view.SizeInBytes;
+				bindingIterator->structureByteStride = view.StrideInBytes;
+				continue;
+			}
 
 			RenderPass::ResourceBindingDiagnostic binding{};
 			binding.pipeline = "Graphics";
 			binding.bindingType = "Vertex Buffer";
-			binding.shaderRegister = startSlot + viewIndex;
+			binding.shaderRegister = slot;
 			binding.gpuAddress = view.BufferLocation;
 			binding.bufferSize = view.SizeInBytes;
 			binding.structureByteStride = view.StrideInBytes;
@@ -2055,6 +2108,10 @@ namespace RenderPassRuntime
 		}
 		RenderPassTexturePool::ScopedInputTextureOverrides inputTextureOverrides(commandList);
 
+		ShaderResourceRuntime::ScopedResourceBindingBatch shaderResourceBindingBatch(commandList);
+
+		RenderPassGPUProfiler::ScopedExecutionSample executionSample(commandList, targetIt->second.modifiedShaderId, boundary == ExecutionBoundary::After);
+
 		thread_local std::vector<RenderPassMipChain::ExecutionResult> mipChainResults;
 		mipChainResults.clear();
 		thread_local std::unordered_set<std::string> unavailableRuntimeResources;
@@ -2085,6 +2142,17 @@ namespace RenderPassRuntime
 		{
 			const RenderPass::RenderPassDisk& renderPass = *renderPassPointer;
 			const RenderPass::PassOperation passOperation = RenderPass::ResolvePassOperation(renderPass);
+
+			//measure the whole injected operation, including copies, descriptor switches, and barriers.
+			RenderPassGPUProfiler::ScopedPassTiming passTiming(commandList, renderPass.name);
+
+			if (passOperation == RenderPass::PassOperation::MipChain)
+			{
+				//mip generation manages its own root signature and heaps; finish the preceding binding batch first.
+				HookD3D12::ScopedRenderPassInjection injectionScope;
+
+				ShaderResourceRuntime::RestoreResourcesImmediately(commandList);
+			}
 			const ResolvedEventBinding* resolvedEvent =
 				FindResolvedEventBinding(*configuration, renderPass);
 			if (!resolvedEvent)
@@ -2872,10 +2940,30 @@ namespace RenderPassRuntime
 					" error=" + executionError);
 			}
 		}
+
+		if (boundary == ExecutionBoundary::Before)
+			RenderPassGPUProfiler::BeginOriginalDraw(commandList, targetIt->second.modifiedShaderId);
+
+		if (state.replacementPassActive)
+		{
+			if (boundary == ExecutionBoundary::Before)
+				shaderResourceBindingBatch.KeepResourcesForOriginalDraw();
+			else
+			{
+				//after-boundary recording has no following target draw, so leave the game state restored now.
+				HookD3D12::ScopedRenderPassInjection injectionScope;
+
+				commandList->SetPipelineState(state.boundPipelineState);
+
+				state.replacementPassActive = false;
+			}
+		}
 	}
 
 	void CompleteGraphicsExecutionBoundary(ID3D12GraphicsCommandList* commandList)
 	{
+		RenderPassGPUProfiler::EndOriginalDraw(commandList);
+
 		CommandListRenderState& state = GetCommandListState(commandList);
 		if (state.replacementPassActive)
 		{
@@ -2896,6 +2984,8 @@ namespace RenderPassRuntime
 
 	void CompleteComputeExecutionBoundary(ID3D12GraphicsCommandList* commandList)
 	{
+		RenderPassGPUProfiler::EndOriginalDraw(commandList);
+
 		CommandListRenderState& state = GetCommandListState(commandList);
 		if (state.replacementPassActive)
 		{
@@ -2932,6 +3022,7 @@ namespace RenderPassRuntime
 			commandQueue,
 			commandListCount,
 			commandLists);
+		RenderPassGPUProfiler::NotifyCommandListsSubmitted(commandQueue, commandListCount, commandLists);
 	}
 
 	//advance temporal resources after the present path finishes the current frame.
@@ -2947,6 +3038,7 @@ namespace RenderPassRuntime
 			return;
 		RenderPassTexturePool::LogPerformanceStatistics();
 		ShaderResourceRuntime::LogPerformanceStatistics();
+		RenderPassGPUProfiler::LogPerformanceStatistics();
 
 		const RenderPassResourceRegistry::RegistryStatistics registryStatistics =
 			RenderPassResourceRegistry::GetStatistics();

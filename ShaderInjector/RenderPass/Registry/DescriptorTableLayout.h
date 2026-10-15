@@ -14,5 +14,7 @@ namespace RenderPassResourceRegistry
 		D3D12_SHADER_VISIBILITY shaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		UINT descriptorCount = 0;
 		bool containsUnboundedRange = false;
+		//static-data promises require a fresh binding point, even when the descriptor bytes are unchanged.
+		bool canReuseBinding = false;
 	};
 } //namespace RenderPassResourceRegistry

@@ -253,6 +253,9 @@
     <ClInclude Include="RenderPass\RenderPassExecutor.h">
       <Filter>RenderPass</Filter>
     </ClInclude>
+    <ClInclude Include="RenderPass\ExecutorEventNameLookup.h">
+      <Filter>RenderPass</Filter>
+    </ClInclude>
     <ClInclude Include="RenderPass\RenderPassMipChain.h">
       <Filter>RenderPass</Filter>
     </ClInclude>
@@ -371,6 +374,15 @@
       <Filter>RenderPass</Filter>
     </ClInclude>
     <ClInclude Include="RenderPass\Registry\DescriptorCopySegment.h">
+      <Filter>RenderPass</Filter>
+    </ClInclude>
+    <ClInclude Include="RenderPass\Registry\DescriptorCopyBatchSpan.h">
+      <Filter>RenderPass</Filter>
+    </ClInclude>
+    <ClInclude Include="RenderPass\Registry\DescriptorCopyBatch.h">
+      <Filter>RenderPass</Filter>
+    </ClInclude>
+    <ClInclude Include="RenderPass\Registry\DescriptorContentVersion.h">
       <Filter>RenderPass</Filter>
     </ClInclude>
     <ClInclude Include="RenderPass\MipChain\DeviceResources.h">
@@ -531,6 +543,18 @@
     <ClInclude Include="ShaderResource\Runtime\ActiveTable.h">
       <Filter>ShaderResource\Runtime</Filter>
     </ClInclude>
+    <ClInclude Include="ShaderResource\Runtime\ChainDescriptorTable.h">
+      <Filter>ShaderResource\Runtime</Filter>
+    </ClInclude>
+    <ClInclude Include="ShaderResource\Runtime\ChainDescriptorPool.h">
+      <Filter>ShaderResource\Runtime</Filter>
+    </ClInclude>
+    <ClInclude Include="ShaderResource\Runtime\DescriptorOverride.h">
+      <Filter>ShaderResource\Runtime</Filter>
+    </ClInclude>
+    <ClInclude Include="ShaderResource\Runtime\SamplerOverride.h">
+      <Filter>ShaderResource\Runtime</Filter>
+    </ClInclude>
     <ClInclude Include="ShaderResource\Runtime\DescriptorHeapPage.h">
       <Filter>ShaderResource\Runtime</Filter>
     </ClInclude>
@@ -543,10 +567,34 @@
     <ClInclude Include="ShaderResource\Runtime\CommandListSlot.h">
       <Filter>ShaderResource\Runtime</Filter>
     </ClInclude>
+    <ClInclude Include="ShaderResource\Runtime\ScopedResourceBindingBatch.h">
+      <Filter>ShaderResource\Runtime</Filter>
+    </ClInclude>
     <ClInclude Include="ShaderResource\Runtime\QueueFence.h">
       <Filter>ShaderResource\Runtime</Filter>
     </ClInclude>
     <ClInclude Include="Performance\PerformanceMetrics.h">
+      <Filter>Performance</Filter>
+    </ClInclude>
+    <ClInclude Include="Performance\GPUTimingCommandList.h">
+      <Filter>Performance</Filter>
+    </ClInclude>
+    <ClInclude Include="Performance\GPUTimingPage.h">
+      <Filter>Performance</Filter>
+    </ClInclude>
+    <ClInclude Include="Performance\GPUTimingQueue.h">
+      <Filter>Performance</Filter>
+    </ClInclude>
+    <ClInclude Include="Performance\GPUTimingSample.h">
+      <Filter>Performance</Filter>
+    </ClInclude>
+    <ClInclude Include="Performance\GPUTimingStatistics.h">
+      <Filter>Performance</Filter>
+    </ClInclude>
+    <ClInclude Include="Performance\GPUTimingToken.h">
+      <Filter>Performance</Filter>
+    </ClInclude>
+    <ClInclude Include="Performance\RenderPassGPUProfiler.h">
       <Filter>Performance</Filter>
     </ClInclude>
     <ClInclude Include="Performance\ThreadMetrics.h">
@@ -1088,6 +1136,9 @@
       <Filter>ShaderResource</Filter>
     </ClCompile>
     <ClCompile Include="Performance\PerformanceMetrics.cpp">
+      <Filter>Performance</Filter>
+    </ClCompile>
+    <ClCompile Include="Performance\RenderPassGPUProfiler.cpp">
       <Filter>Performance</Filter>
     </ClCompile>
     <ClCompile Include="GUI\ShaderInjectorGUI_ApplyStyle.cpp">
