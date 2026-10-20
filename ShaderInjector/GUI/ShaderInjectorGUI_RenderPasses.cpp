@@ -31,6 +31,7 @@
 #include "RenderDoc/RenderDocIntegration.h"
 #include "RenderPass/RenderPassRuntime.h"
 #include "ShaderResource/DatabaseShaderResources.h"
+#include "ShaderResource/Runtime/ShaderResourceRuntime.h"
 #include "ShaderResource/ShaderResourceCatalog.h"
 #include "ShaderDiscovery/ShaderAutomaticDiscovery.h"
 #include "StringHelper.h"
@@ -1066,7 +1067,7 @@ namespace ShaderInjectorGUI
 		else if (binding.origin == ShaderResource::ResourceOrigin::Disk && !outputs)
 		{
 			if (ImGui::Button("Refresh DDS Resources"))
-				DatabaseShaderResources::RefreshShaderResources();
+				ShaderResourceRuntime::ReloadTextures();
 			const auto& imported = DatabaseShaderResources::GetShaderResources();
 			const ShaderResource::TextureDisk* selected = DatabaseShaderResources::FindShaderResourceById(binding.resourceId);
 			std::string preview = DisplayNameOrFallback(binding.resourceId, "(none)");

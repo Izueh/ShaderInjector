@@ -12,10 +12,13 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <shared_mutex>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+
+#include <wrl/client.h>
 
 #include "HookD3D12.h"
 #include "GUI/ShaderInjectorGUI.h"
@@ -39,6 +42,7 @@
 #include "RenderPass/Runtime/ShaderTargetBinding.h"
 #include "RenderPass/Runtime/ThreadGameTextureBindingLookup.h"
 #include "ShaderResource/ShaderResourceCatalog.h"
+#include "ShaderResource/Runtime/DescriptorHeapReserve.h"
 #include "ShaderResource/Runtime/ShaderResourceRuntime.h"
 #include "ShaderResource/Runtime/ScopedResourceBindingBatch.h"
 #include "IO/ShaderInjectorIO.h"
@@ -65,10 +69,24 @@ namespace RenderPassRuntime
 	std::atomic<uint32_t> gComputeExecutionBoundaryMask = 0;
 	std::atomic<uint64_t> gExecutionTrackingGeneration = 1;
 
+	using ShaderPatchBindingMap = std::unordered_map<ID3D12PipelineState*, std::shared_ptr<const ShaderPatchBinding>>;
+	const ShaderPatchBindingMap gEmptyShaderPatchBindingMap;
+	std::atomic<const ShaderPatchBindingMap*> gPublishedShaderPatchBindings = &gEmptyShaderPatchBindingMap;
+	std::atomic<bool> gHasShaderPatchBindings = false;
+	std::atomic<bool> gShaderPatchTrackingRequired = false;
+	std::atomic<uint32_t> gShaderPatchGraphicsBoundaryMask = 0;
+	std::atomic<uint32_t> gShaderPatchComputeBoundaryMask = 0;
+	//texture patches replay every root argument, so they bind only on recordings tracked from their Reset.
+	//the epoch advances when the tracking hooks install and whenever tracking turns back on.
+	std::atomic<bool> gCommandListTrackingHooksInstalled = false;
+	std::atomic<uint64_t> gTrackingEpoch = 1;
+
 	std::mutex gConfigurationPublishMutex;
 	std::vector<std::unique_ptr<const RenderPassConfigurationSnapshot>> gOwnedConfigurationSnapshots;
 	std::vector<std::unique_ptr<const ShaderTargetBindingMap>> gOwnedShaderTargetBindingSnapshots;
+	std::vector<std::unique_ptr<const ShaderPatchBindingMap>> gOwnedShaderPatchBindingSnapshots;
 	ShaderTargetBindingMap gPendingShaderTargetBindings;
+	ShaderPatchBindingMap gPendingShaderPatchBindings;
 
 	std::mutex gCommandListRegistryMutex;
 	std::unordered_map<ID3D12GraphicsCommandList*, std::unique_ptr<CommandListRenderState>> gCommandListStates;
@@ -90,14 +108,18 @@ namespace RenderPassRuntime
 	//turn on only the hook tracking needed by the currently published pass graph.
 	void RefreshTrackingModeFlags()
 	{
+		//texture shader patches rebind every game root argument on an expanded root.
+		const bool shaderPatchTrackingEnabled = gHasShaderPatchBindings.load(std::memory_order_relaxed);
 		const bool trackingEnabled =
-			gHasEnabledRenderPasses.load(std::memory_order_relaxed) &&
-			gHasExecutableRenderPassBinding.load(std::memory_order_relaxed);
+			(gHasEnabledRenderPasses.load(std::memory_order_relaxed) &&
+			 gHasExecutableRenderPassBinding.load(std::memory_order_relaxed)) ||
+			shaderPatchTrackingEnabled;
 		const bool resourceTrackingEnabled = trackingEnabled &&
 											 gResourceTrackingRequired.load(std::memory_order_relaxed);
 		const bool rootBindingTrackingEnabled = trackingEnabled &&
 												(gHasInheritedGameBindings.load(std::memory_order_relaxed) ||
-												 gHasExecutableMipChainBinding.load(std::memory_order_relaxed));
+												 gHasExecutableMipChainBinding.load(std::memory_order_relaxed) ||
+												 shaderPatchTrackingEnabled);
 		const bool descriptorTableTrackingEnabled = trackingEnabled &&
 													(gHasShaderResourcePasses.load(std::memory_order_relaxed) ||
 													 gHasExecutableMipChainBinding.load(std::memory_order_relaxed) ||
@@ -127,6 +149,8 @@ namespace RenderPassRuntime
 			trackingModeFlags |= DescriptorRegistryTrackingEnabled;
 		if (graphicsStateTrackingEnabled)
 			trackingModeFlags |= GraphicsStateTrackingEnabled;
+		if ((trackingModeFlags & TrackingEnabled) && !(gTrackingModeFlags.load(std::memory_order_relaxed) & TrackingEnabled))
+			gTrackingEpoch.fetch_add(1, std::memory_order_acq_rel);
 		gTrackingModeFlags.store(trackingModeFlags, std::memory_order_release);
 	}
 
@@ -437,7 +461,20 @@ namespace RenderPassRuntime
 			gPublishedShaderTargetBindings.load(std::memory_order_acquire);
 		const auto shaderTargetIt = shaderTargetBindings->find(state.pipelineState);
 		if (shaderTargetIt == shaderTargetBindings->end())
+		{
+			const ShaderPatchBindingMap* shaderPatchBindings =
+				gPublishedShaderPatchBindings.load(std::memory_order_acquire);
+			const auto shaderPatchIt = shaderPatchBindings->find(state.pipelineState);
+			if (shaderPatchIt == shaderPatchBindings->end())
+				return;
+
+			//texture patches bind before the draw or dispatch only (bit 0, the Before boundary).
+			if (shaderPatchIt->second->computePipeline)
+				state.computeExecutionBoundaryMask = 1u;
+			else
+				state.graphicsExecutionBoundaryMask = 1u;
 			return;
+		}
 
 		const RenderPassConfigurationSnapshot* configuration =
 			gPublishedConfiguration.load(std::memory_order_acquire);
@@ -1394,8 +1431,8 @@ namespace RenderPassRuntime
 	uint32_t PublishedExecutionBoundaryMask(bool computePipeline, std::memory_order memoryOrder)
 	{
 		if (computePipeline)
-			return gComputeExecutionBoundaryMask.load(memoryOrder);
-		return gGraphicsExecutionBoundaryMask.load(memoryOrder);
+			return gComputeExecutionBoundaryMask.load(memoryOrder) | gShaderPatchComputeBoundaryMask.load(memoryOrder);
+		return gGraphicsExecutionBoundaryMask.load(memoryOrder) | gShaderPatchGraphicsBoundaryMask.load(memoryOrder);
 	}
 
 	uint32_t BoundaryBit(ExecutionBoundary boundary)
@@ -1460,6 +1497,163 @@ namespace RenderPassRuntime
 	{
 		std::lock_guard<std::mutex> lock(gConfigurationPublishMutex);
 		gPendingShaderTargetBindings.clear();
+		gPendingShaderPatchBindings.clear();
+	}
+
+	void AddShaderPatchBinding(
+		ID3D12PipelineState* pipelineState,
+		std::shared_ptr<const ShaderPatchBinding> binding)
+	{
+		if (!pipelineState || !binding || !binding->pipelineState || !binding->rootSignature)
+			return;
+
+		std::lock_guard<std::mutex> lock(gConfigurationPublishMutex);
+		gPendingShaderPatchBindings[pipelineState] = std::move(binding);
+	}
+
+	void SetShaderPatchTrackingRequired(bool required)
+	{
+		std::lock_guard<std::mutex> lock(gConfigurationPublishMutex);
+		gShaderPatchTrackingRequired.store(required, std::memory_order_release);
+		RefreshTrackingModeFlags();
+	}
+
+	bool IsShaderPatchTrackingRequired()
+	{
+		return gShaderPatchTrackingRequired.load(std::memory_order_acquire);
+	}
+
+	//a root constant range or root view an ExecuteIndirect signature writes.
+	struct IndirectRootWrite
+	{
+		RootBindingType type = RootBindingType::Constants;
+		UINT rootParameterIndex = 0;
+		UINT destinationOffset = 0;
+		UINT valueCount = 0;
+	};
+
+	struct CommandSignatureInfo
+	{
+		bool computeDispatch = false;
+		bool writesRootArguments = false;
+		std::vector<IndirectRootWrite> rootWrites;
+	};
+	std::shared_mutex gCommandSignatureMutex;
+	std::unordered_map<ID3D12CommandSignature*, CommandSignatureInfo> gCommandSignatures;
+
+	void TrackCommandSignature(ID3D12CommandSignature* commandSignature, const D3D12_COMMAND_SIGNATURE_DESC& description)
+	{
+		CommandSignatureInfo info;
+		for (UINT index = 0; index < description.NumArgumentDescs && description.pArgumentDescs; ++index)
+		{
+			const D3D12_INDIRECT_ARGUMENT_DESC& argument = description.pArgumentDescs[index];
+			if (argument.Type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT)
+				info.rootWrites.push_back({RootBindingType::Constants, argument.Constant.RootParameterIndex, argument.Constant.DestOffsetIn32BitValues, argument.Constant.Num32BitValuesToSet});
+			else if (argument.Type == D3D12_INDIRECT_ARGUMENT_TYPE_INCREMENTING_CONSTANT)
+				info.rootWrites.push_back({RootBindingType::Constants, argument.IncrementingConstant.RootParameterIndex, argument.IncrementingConstant.DestOffsetIn32BitValues, 1});
+			else if (argument.Type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW)
+				info.rootWrites.push_back({RootBindingType::ConstantBufferView, argument.ConstantBufferView.RootParameterIndex});
+			else if (argument.Type == D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW)
+				info.rootWrites.push_back({RootBindingType::ShaderResourceView, argument.ShaderResourceView.RootParameterIndex});
+			else if (argument.Type == D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW)
+				info.rootWrites.push_back({RootBindingType::UnorderedAccessView, argument.UnorderedAccessView.RootParameterIndex});
+
+			switch (argument.Type)
+			{
+			case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH:
+				info.computeDispatch = true;
+				break;
+			case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW:
+			case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED:
+			case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
+			case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW:
+			case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW:
+				break;
+			default:
+				//root constants and views, and ray dispatches, depend on the game's root signature.
+				info.writesRootArguments = true;
+				break;
+			}
+		}
+
+		std::unique_lock<std::shared_mutex> lock(gCommandSignatureMutex);
+		gCommandSignatures[commandSignature] = info;
+	}
+
+	void FindCommandSignature(ID3D12CommandSignature* commandSignature, bool& outComputeDispatch, bool& outWritesRootArguments)
+	{
+		outComputeDispatch = false;
+		outWritesRootArguments = true;
+		std::shared_lock<std::shared_mutex> lock(gCommandSignatureMutex);
+		const auto found = gCommandSignatures.find(commandSignature);
+		if (found == gCommandSignatures.end())
+			return;
+		outComputeDispatch = found->second.computeDispatch;
+		outWritesRootArguments = found->second.writesRootArguments;
+	}
+
+	//ExecuteIndirect leaves the root constants it wrote at 0 and the root views at null; replaying the
+	//values set before it would hand later draws state the game never has.
+	void TrackExecuteIndirect(ID3D12GraphicsCommandList* commandList, ID3D12CommandSignature* commandSignature, bool computePipeline)
+	{
+		if (!IsTrackingRequired() || !IsRootBindingTrackingRequired())
+			return;
+
+		std::shared_lock<std::shared_mutex> lock(gCommandSignatureMutex);
+		const auto found = gCommandSignatures.find(commandSignature);
+		if (found == gCommandSignatures.end() || found->second.rootWrites.empty())
+			return;
+
+		CommandListRenderState& state = GetCommandListState(commandList);
+		for (const IndirectRootWrite& write : found->second.rootWrites)
+		{
+			RootBindingState& binding = RootBindingAt(state, computePipeline, write.rootParameterIndex);
+			if (write.type != RootBindingType::Constants)
+			{
+				binding.type = write.type;
+				binding.value = 0;
+				binding.constants.clear();
+				continue;
+			}
+
+			if (binding.type != RootBindingType::Constants)
+			{
+				binding.type = RootBindingType::Constants;
+				binding.value = 0;
+				binding.constants.clear();
+			}
+			if (binding.constants.size() < write.destinationOffset + write.valueCount)
+				binding.constants.resize(write.destinationOffset + write.valueCount);
+			std::fill_n(binding.constants.begin() + write.destinationOffset, write.valueCount, 0u);
+		}
+	}
+
+	//publish shader-patch bindings only when they change; like shader-target snapshots, they stay alive for recording threads.
+	void CommitShaderPatchBindingUpdateLocked()
+	{
+		const ShaderPatchBindingMap& currentBindings = *gPublishedShaderPatchBindings.load(std::memory_order_acquire);
+		if (currentBindings == gPendingShaderPatchBindings)
+			return;
+
+		uint32_t graphicsBoundaryMask = 0;
+		uint32_t computeBoundaryMask = 0;
+		for (const auto& entry : gPendingShaderPatchBindings)
+		{
+			if (entry.second->computePipeline)
+				computeBoundaryMask = BoundaryBit(ExecutionBoundary::Before);
+			else
+				graphicsBoundaryMask = BoundaryBit(ExecutionBoundary::Before);
+		}
+
+		auto snapshot = std::make_unique<const ShaderPatchBindingMap>(gPendingShaderPatchBindings);
+		const ShaderPatchBindingMap* snapshotPointer = snapshot.get();
+		gOwnedShaderPatchBindingSnapshots.push_back(std::move(snapshot));
+		gPublishedShaderPatchBindings.store(snapshotPointer, std::memory_order_release);
+		gShaderPatchGraphicsBoundaryMask.store(graphicsBoundaryMask, std::memory_order_release);
+		gShaderPatchComputeBoundaryMask.store(computeBoundaryMask, std::memory_order_release);
+		gHasShaderPatchBindings.store(!snapshotPointer->empty(), std::memory_order_release);
+		gExecutionTrackingGeneration.fetch_add(1, std::memory_order_acq_rel);
+		RefreshTrackingModeFlags();
 	}
 
 	void AddShaderTargetBinding(
@@ -1486,6 +1680,7 @@ namespace RenderPassRuntime
 	void CommitShaderTargetBindingUpdate()
 	{
 		std::lock_guard<std::mutex> lock(gConfigurationPublishMutex);
+		CommitShaderPatchBindingUpdateLocked();
 		const ShaderTargetBindingMap& currentBindings = *gPublishedShaderTargetBindings.load(std::memory_order_acquire);
 		bool bindingsChanged = currentBindings.size() != gPendingShaderTargetBindings.size();
 
@@ -1546,12 +1741,19 @@ namespace RenderPassRuntime
 	}
 
 	//drop the previous recording's state before the game starts filling this command list again.
+	void NotifyCommandListTrackingHooksInstalled()
+	{
+		gCommandListTrackingHooksInstalled.store(true, std::memory_order_release);
+		gTrackingEpoch.fetch_add(1, std::memory_order_acq_rel);
+	}
+
 	void ResetCommandList(ID3D12GraphicsCommandList* commandList, ID3D12PipelineState* initialPipelineState)
 	{
 		if (!IsTrackingRequired())
 			return;
 
 		CommandListRenderState& state = GetCommandListState(commandList);
+		state.trackingEpoch = gCommandListTrackingHooksInstalled.load(std::memory_order_acquire) ? gTrackingEpoch.load(std::memory_order_acquire) : 0;
 		state.pipelineState = initialPipelineState;
 		state.boundPipelineState = initialPipelineState;
 		state.graphicsRootSignature = nullptr;
@@ -1662,8 +1864,6 @@ namespace RenderPassRuntime
 
 		state.descriptorHeaps.clear();
 		state.descriptorHeaps.reserve(descriptorHeapCount);
-		ResetRootBindings(state.graphicsRootBindings, true);
-		ResetRootBindings(state.computeRootBindings, true);
 
 		EnsureDescriptorIncrementSizes(commandList, state);
 
@@ -1690,6 +1890,25 @@ namespace RenderPassRuntime
 				heap.descriptorIncrementSize);
 
 			state.descriptorHeaps.push_back(heap);
+		}
+
+		//rebinding a heap keeps its tables valid (e.g. only the sampler heap changed), and the game does not
+		//set them again; drop only tables that point outside every heap now bound.
+		for (std::vector<RootBindingState>* bindings : {&state.graphicsRootBindings, &state.computeRootBindings})
+		{
+			for (RootBindingState& binding : *bindings)
+			{
+				if (binding.type != RootBindingType::DescriptorTable)
+					continue;
+				const bool insideBoundHeap = std::any_of(state.descriptorHeaps.begin(), state.descriptorHeaps.end(), [&](const DescriptorHeapState& heap)
+														 { return heap.gpuStart.ptr && binding.value >= heap.gpuStart.ptr &&
+																  binding.value < heap.gpuStart.ptr + static_cast<uint64_t>(heap.descriptorCount) * heap.descriptorIncrementSize; });
+				if (!insideBoundHeap)
+				{
+					binding.type = RootBindingType::None;
+					binding.value = 0;
+				}
+			}
 		}
 	}
 
@@ -2024,6 +2243,112 @@ namespace RenderPassRuntime
 			state.scissorRectangles.clear();
 	}
 
+	//bind a texture shader patch for the following game draw or dispatch, like a replacement pass.
+	//on failure the game's own pipeline and bindings stay in place for this call.
+	void RecordShaderPatchBoundary(
+		ID3D12GraphicsCommandList* commandList,
+		CommandListRenderState& state,
+		bool computePipeline,
+		bool indirectWritesRootArguments)
+	{
+		const ShaderPatchBindingMap* shaderPatchBindings =
+			gPublishedShaderPatchBindings.load(std::memory_order_acquire);
+		const auto shaderPatchIt = shaderPatchBindings->find(state.pipelineState);
+		if (shaderPatchIt == shaderPatchBindings->end())
+			return;
+		if (shaderPatchIt->second->computePipeline != computePipeline)
+			return;
+
+		//indirect command signatures that write root arguments are laid out for the game's root.
+		if (indirectWritesRootArguments)
+			return;
+
+		//a recording that began before its root arguments were tracked could not be replayed; the next one will.
+		if (!state.trackingEpoch || state.trackingEpoch != gTrackingEpoch.load(std::memory_order_acquire) ||
+			!(computePipeline ? state.computeRootSignature : state.graphicsRootSignature))
+			return;
+
+		const ShaderPatchBinding& binding = *shaderPatchIt->second;
+		//report each distinct reason once per pipeline; a transient failure must not hide a later one.
+		const auto reportSkipped = [&](const std::string& reason)
+		{
+			static std::mutex reportedMutex;
+			static std::unordered_set<std::string> reported;
+			{
+				std::lock_guard<std::mutex> lock(reportedMutex);
+				if (!reported.insert(StringHelper::PointerToString(state.pipelineState) + reason).second)
+					return;
+			}
+			ShaderInjectorIO::WriteToLogFileWarning(StringHelper::Format("RenderPassRuntime->RecordShaderPatchBoundary: texture patch skipped for PSO %p: %s", state.pipelineState, reason.c_str()));
+		};
+
+		//patches only use textures ShaderResourceRuntime has loaded; the original draws until they are.
+		thread_local std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> shaderResourceViews;
+		shaderResourceViews.resize(binding.textures.size());
+		for (size_t textureIndex = 0; textureIndex < binding.textures.size(); ++textureIndex)
+		{
+			if (!ShaderResourceRuntime::FindTextureShaderResourceView(binding.device, binding.textures[textureIndex], shaderResourceViews[textureIndex]))
+			{
+				reportSkipped("texture " + binding.textures[textureIndex] + " is not loaded");
+				return;
+			}
+		}
+
+		//the added table lives in the tail of the game's bound heap, so the game's tables stay valid as-is.
+		ID3D12DescriptorHeap* resourceHeap = nullptr;
+		for (const DescriptorHeapState& heap : state.descriptorHeaps)
+		{
+			if (heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+				resourceHeap = heap.heap;
+		}
+
+		D3D12_GPU_DESCRIPTOR_HANDLE addedTable{};
+		if (!resourceHeap)
+		{
+			reportSkipped("no CBV/SRV/UAV heap is bound");
+			return;
+		}
+		if (!ShaderResourceRuntime::GetOrCreateReservedTable(resourceHeap, shaderResourceViews, addedTable))
+		{
+			reportSkipped("the bound descriptor heap has no free texture-patch reserve (created before recipes loaded, or full)");
+			return;
+		}
+
+		//a root-signature change drops every root argument, so the game's are replayed on the expanded root.
+		HookD3D12::ScopedRenderPassInjection injectionScope;
+		BuildShaderResourceState(state, computePipeline, gShaderResourceState);
+		if (computePipeline)
+		{
+			commandList->SetComputeRootSignature(binding.rootSignature);
+			RenderPassMipChain::RestoreRootArguments(commandList, gShaderResourceState, true, true);
+			commandList->SetComputeRootDescriptorTable(binding.appendedTableIndex, addedTable);
+		}
+		else
+		{
+			commandList->SetGraphicsRootSignature(binding.rootSignature);
+			RenderPassMipChain::RestoreRootArguments(commandList, gShaderResourceState, false, true);
+			commandList->SetGraphicsRootDescriptorTable(binding.appendedTableIndex, addedTable);
+		}
+		commandList->SetPipelineState(binding.pipelineState);
+		state.replacementPassActive = true;
+		state.shaderPatchActive = true;
+	}
+
+	//put the game's root signature and arguments back after a texture-patched draw or dispatch.
+	void RestoreShaderPatchRoot(ID3D12GraphicsCommandList* commandList, CommandListRenderState& state, bool computePipeline)
+	{
+		if (!state.shaderPatchActive)
+			return;
+
+		state.shaderPatchActive = false;
+		BuildShaderResourceState(state, computePipeline, gShaderResourceState);
+		if (computePipeline)
+			commandList->SetComputeRootSignature(state.computeRootSignature);
+		else
+			commandList->SetGraphicsRootSignature(state.graphicsRootSignature);
+		RenderPassMipChain::RestoreRootArguments(commandList, gShaderResourceState, computePipeline, true);
+	}
+
 	//match this draw or dispatch against the published graph and record eligible passes.
 	void RecordExecutionBoundary(
 		ID3D12GraphicsCommandList* commandList,
@@ -2032,7 +2357,9 @@ namespace RenderPassRuntime
 		const char* operationName,
 		UINT originalThreadGroupCountX,
 		UINT originalThreadGroupCountY,
-		UINT originalThreadGroupCountZ)
+		UINT originalThreadGroupCountZ,
+		bool indirectExecution,
+		bool indirectWritesRootArguments)
 	{
 		if (!IsTrackingRequired())
 			return;
@@ -2048,6 +2375,14 @@ namespace RenderPassRuntime
 			gPublishedShaderTargetBindings.load(std::memory_order_acquire);
 		const auto targetIt = shaderTargetBindings->find(state.pipelineState);
 		if (targetIt == shaderTargetBindings->end())
+		{
+			if (boundary == ExecutionBoundary::Before)
+				RecordShaderPatchBoundary(commandList, state, computePipeline, indirectWritesRootArguments);
+			return;
+		}
+
+		//render passes keep their graphics-only ExecuteIndirect boundary; compute indirect is for patches.
+		if (indirectExecution && computePipeline)
 			return;
 
 		const RenderPassConfigurationSnapshot* configuration =
@@ -2969,6 +3304,7 @@ namespace RenderPassRuntime
 		{
 			HookD3D12::ScopedRenderPassInjection injectionScope;
 			commandList->SetPipelineState(state.boundPipelineState);
+			RestoreShaderPatchRoot(commandList, state, false);
 			ShaderResourceRuntime::RestoreResources(commandList);
 			state.replacementPassActive = false;
 		}
@@ -2991,6 +3327,7 @@ namespace RenderPassRuntime
 		{
 			HookD3D12::ScopedRenderPassInjection injectionScope;
 			commandList->SetPipelineState(state.boundPipelineState);
+			RestoreShaderPatchRoot(commandList, state, true);
 			ShaderResourceRuntime::RestoreResources(commandList);
 			state.replacementPassActive = false;
 		}

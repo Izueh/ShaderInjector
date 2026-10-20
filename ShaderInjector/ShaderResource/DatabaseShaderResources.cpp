@@ -1,7 +1,9 @@
 #include "ShaderResource/DatabaseShaderResources.h"
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
+#include <mutex>
 #include <unordered_map>
 
 #include "IO/ShaderInjectorIO.h"
@@ -12,13 +14,15 @@ namespace DatabaseShaderResources
 {
 	std::vector<ShaderResource::TextureDisk> gShaderResources;
 	std::unordered_map<std::string, size_t> gShaderResourceIndices;
-	bool gShaderResourcesLoaded = false;
+	std::atomic<bool> gShaderResourcesLoaded = false;
+	//device creation loads textures while the startup worker publishes render passes; scan once, swap in whole.
+	std::mutex gShaderResourcesMutex;
+	std::mutex gEnsureLoadedMutex;
 
 	void RefreshShaderResources()
 	{
-		gShaderResources.clear();
-		gShaderResourceIndices.clear();
-		gShaderResourcesLoaded = true;
+		std::vector<ShaderResource::TextureDisk> shaderResources;
+		std::unordered_map<std::string, size_t> shaderResourceIndices;
 		const std::string rootDirectory = ShaderInjectorIO::GetShaderResourcesDirectory();
 		ShaderInjectorIO::DirectoryCreate(rootDirectory);
 
@@ -58,25 +62,43 @@ namespace DatabaseShaderResources
 				ShaderInjectorIO::WriteToLogFileWarning("DatabaseShaderResources->RefreshShaderResources: invalid DDS resource = " + resource.id + " error=" + resource.validationError);
 			}
 
-			gShaderResources.push_back(std::move(resource));
+			shaderResources.push_back(std::move(resource));
 		}
 
-		std::sort(gShaderResources.begin(), gShaderResources.end(), [](const auto& left, const auto& right)
+		std::sort(shaderResources.begin(), shaderResources.end(), [](const auto& left, const auto& right)
 				  { return left.id < right.id; });
 
-		gShaderResourceIndices.reserve(gShaderResources.size());
+		shaderResourceIndices.reserve(shaderResources.size());
 
-		for (size_t resourceIndex = 0; resourceIndex < gShaderResources.size(); ++resourceIndex)
-			gShaderResourceIndices.emplace(gShaderResources[resourceIndex].id, resourceIndex);
+		for (size_t resourceIndex = 0; resourceIndex < shaderResources.size(); ++resourceIndex)
+			shaderResourceIndices.emplace(shaderResources[resourceIndex].id, resourceIndex);
 
-		ShaderResourceCatalog::PublishDiskResources(gShaderResources);
-		ShaderInjectorIO::WriteToLogFile("DatabaseShaderResources->RefreshShaderResources: loaded DDS textures = " + std::to_string(gShaderResources.size()));
+		const size_t resourceCount = shaderResources.size();
+		{
+			std::lock_guard<std::mutex> lock(gShaderResourcesMutex);
+			gShaderResources.swap(shaderResources);
+			gShaderResourceIndices.swap(shaderResourceIndices);
+			gShaderResourcesLoaded.store(true, std::memory_order_release);
+			ShaderResourceCatalog::PublishDiskResources(gShaderResources);
+		}
+
+		ShaderInjectorIO::WriteToLogFile("DatabaseShaderResources->RefreshShaderResources: loaded DDS textures = " + std::to_string(resourceCount));
 	}
 
 	void EnsureShaderResourcesLoaded()
 	{
-		if (!gShaderResourcesLoaded)
+		if (gShaderResourcesLoaded.load(std::memory_order_acquire))
+			return;
+		std::lock_guard<std::mutex> lock(gEnsureLoadedMutex);
+		if (!gShaderResourcesLoaded.load(std::memory_order_acquire))
 			RefreshShaderResources();
+	}
+
+	std::vector<ShaderResource::TextureDisk> CopyShaderResources()
+	{
+		EnsureShaderResourcesLoaded();
+		std::lock_guard<std::mutex> lock(gShaderResourcesMutex);
+		return gShaderResources;
 	}
 
 	const std::vector<ShaderResource::TextureDisk>& GetShaderResources()

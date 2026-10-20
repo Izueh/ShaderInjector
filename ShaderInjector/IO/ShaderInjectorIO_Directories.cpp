@@ -78,6 +78,11 @@ namespace ShaderInjectorIO
 		return JoinPath(GetShaderInjectorDirectory(), "ShaderResources");
 	}
 
+	std::string GetShaderPatchesDirectory()
+	{
+		return JoinPath(GetShaderInjectorDirectory(), "ShaderPatches");
+	}
+
 	std::string GetModifiedShadersDirectory()
 	{
 		return JoinPath(GetShaderInjectorDirectory(), "ModifiedShaders");

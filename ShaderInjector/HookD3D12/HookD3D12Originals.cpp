@@ -21,6 +21,7 @@ namespace HookD3D12
 	FunctionSetComputeRootSignatureD3D12 Original_SetComputeRootSignature = nullptr;
 	FunctionCreateComputePipelineStateD3D12 Original_CreateComputePipelineState = nullptr;
 	FunctionCreateRootSignatureD3D12 Original_CreateRootSignature = nullptr;
+	FunctionCreateCommandSignatureD3D12 Original_CreateCommandSignature = nullptr;
 	FunctionCreateGraphicsPipelineStateD3D12 Original_CreateGraphicsPipelineState = nullptr;
 	FunctionCreatePipelineStateD3D12 Original_CreatePipelineState = nullptr;
 	FunctionDrawInstancedD3D12 Original_DrawInstanced = nullptr;

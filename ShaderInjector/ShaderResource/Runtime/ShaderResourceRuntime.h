@@ -26,6 +26,13 @@ namespace ShaderResourceRuntime
 		bool computePipeline,
 		std::string& outError,
 		const RuntimeTextureBindingOverride* runtimeTextureOverride = nullptr);
+	//upload every imported DDS not yet loaded for the device on a private queue and wait for it, leaving each in
+	//the COMMON state so any later game command list (direct or compute) can read it.
+	void LoadTextures(ID3D12Device* device);
+	//rescan the imported DDS folder and replace changed textures, add new ones and drop removed ones.
+	void ReloadTextures();
+	//the CPU-only SRV of a texture loaded by LoadTextures; false when the texture is not loaded.
+	bool FindTextureShaderResourceView(ID3D12Device* device, const std::string& resourceId, D3D12_CPU_DESCRIPTOR_HANDLE& outShaderResourceView);
 	void RestoreResources(ID3D12GraphicsCommandList* commandList);
 	//flush before another subsystem changes descriptor heaps, even while a graph batch is active.
 	void RestoreResourcesImmediately(ID3D12GraphicsCommandList* commandList);

@@ -32,6 +32,10 @@ namespace RenderPassRuntime
 		uint32_t computeExecutionBoundaryMask = 0;
 		uint64_t executionTrackingGeneration = 0;
 		bool replacementPassActive = false;
+		//a texture shader patch swapped in its expanded root for the next draw or dispatch.
+		bool shaderPatchActive = false;
+		//the tracking epoch this recording began in; 0 when its root arguments may be incomplete.
+		uint64_t trackingEpoch = 0;
 
 		CommandListRenderState()
 		{

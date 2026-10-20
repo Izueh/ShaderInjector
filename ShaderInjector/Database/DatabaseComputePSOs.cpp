@@ -7,6 +7,7 @@
 #include "Hash/Hash.h"
 #include "ShaderDiscovery/ShaderAutomaticDiscovery.h"
 #include "ShaderModelDetector.h"
+#include "ShaderPatch/ShaderPatchRuntime.h"
 
 namespace HookD3D12
 {
@@ -55,5 +56,6 @@ namespace HookD3D12
 			RegisterKnownPipelineStateLocked(capturedComputePipeline.pipelineState);
 
 		gComputePipelines.push_back(capturedComputePipeline);
+		ShaderPatchRuntime::NotifyPipelineCreated(capturedComputePipeline.pipelineState);
 	}
 } //namespace HookD3D12

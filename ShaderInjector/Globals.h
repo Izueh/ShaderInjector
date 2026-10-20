@@ -24,6 +24,7 @@ namespace Globals
 	//observes the settings loaded from ShaderInjector.ini instead of keeping its own copy.
 	extern bool gShowShaderInjectorGUI;
 	extern std::atomic<bool> gShaderInjectorEnabled;
+	extern std::atomic<bool> gShaderPatchesEnabled;
 	extern bool gRenderDocIntegrationEnabled;
 	extern bool gRenderDocAutoAttachEnabled;
 

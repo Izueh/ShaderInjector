@@ -163,6 +163,7 @@ namespace ShaderInjectorGUI
 		DrawModifiedShaders();
 		DrawShaderConfiguration();
 		DrawShaderTargets();
+		DrawShaderPatches();
 		DrawShaderResources();
 		DrawRenderPasses();
 		DrawDeveloperSettings();

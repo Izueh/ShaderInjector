@@ -3,6 +3,7 @@
 
 #include "GUI/ShaderInjectorGUI.h"
 #include "IO/ShaderInjectorIO.h"
+#include "ShaderPatch/ShaderPatchRuntime.h"
 
 namespace HookD3D12
 {
@@ -24,6 +25,8 @@ namespace HookD3D12
 			{
 				InstallPipelineHooksForDevice(device);
 				InstallRenderPassResourceHooksForDevice(device);
+				//shader patch recipes load before the game creates its heaps and pipelines.
+				ShaderPatchRuntime::Initialize();
 
 				RegisterDevice(device);
 

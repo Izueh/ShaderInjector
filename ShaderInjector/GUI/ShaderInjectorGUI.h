@@ -35,6 +35,7 @@ namespace ShaderInjectorGUI
 
 	//===================== shader targets =====================
 	void DrawShaderTargets();
+	void DrawShaderPatches();
 
 	template <typename PipelineT>
 	bool PipelineUsesReplacement(const PipelineT& pipeline, const ShaderTarget::ShaderTargetDisk& replacement);
@@ -99,5 +100,5 @@ namespace ShaderInjectorGUI
 	std::string GetRuntimeLogSnapshot();
 
 	//===================== style =====================
-	void ApplyGUIStyle();
+	void ApplyGUIStyle(HWND window);
 } //namespace ShaderInjectorGUI

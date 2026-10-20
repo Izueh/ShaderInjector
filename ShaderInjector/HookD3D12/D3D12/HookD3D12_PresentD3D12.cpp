@@ -16,9 +16,43 @@
 #include "imgui.h"
 #include "imgui_impl_dx12.h"
 #include "imgui_impl_win32.h"
+#include <vector>
 
 namespace HookD3D12
 {
+	namespace
+	{
+		constexpr UINT overlayDescriptorCapacity = 64;
+		std::vector<UINT> overlayFreeDescriptors;
+		HWND overlayWindow = nullptr;
+
+		void AllocateOverlayDescriptor(ImGui_ImplDX12_InitInfo* info, D3D12_CPU_DESCRIPTOR_HANDLE* cpu, D3D12_GPU_DESCRIPTOR_HANDLE* gpu)
+		{
+			//ImGui 1.92 allocates one descriptor per texture; the capacity covers its font atlas pages.
+			UINT index = 0;
+			if (overlayFreeDescriptors.empty())
+				ShaderInjectorIO::WriteToLogFileError("HookD3D12->AllocateOverlayDescriptor: ImGui descriptor heap exhausted");
+			else
+			{
+				index = overlayFreeDescriptors.back();
+				overlayFreeDescriptors.pop_back();
+			}
+			const UINT stride = info->Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+			*cpu = info->SrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart();
+			*gpu = info->SrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart();
+			cpu->ptr += SIZE_T(index) * stride;
+			gpu->ptr += UINT64(index) * stride;
+		}
+		void FreeOverlayDescriptor(ImGui_ImplDX12_InitInfo* info, D3D12_CPU_DESCRIPTOR_HANDLE cpu, D3D12_GPU_DESCRIPTOR_HANDLE gpu)
+		{
+			const UINT stride = info->Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+			const SIZE_T cpuOffset = cpu.ptr - info->SrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart().ptr;
+			const UINT64 gpuOffset = gpu.ptr - info->SrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart().ptr;
+			if (cpuOffset % stride || cpuOffset != gpuOffset || cpuOffset / stride >= overlayDescriptorCapacity) return;
+			overlayFreeDescriptors.push_back(static_cast<UINT>(cpuOffset / stride));
+		}
+	} //namespace
+
 	static HRESULT HandlePresentD3D12(
 		IDXGISwapChain3* pSwapChain,
 		UINT SyncInterval,
@@ -166,6 +200,7 @@ namespace HookD3D12
 			}
 
 			heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+			heapDesc.NumDescriptors = overlayDescriptorCapacity;
 			heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 
 			//IMPORTANT NOTE: this seems to pass fortunately, it doesn't fail
@@ -215,22 +250,21 @@ namespace HookD3D12
 			ImGuiIO& io = ImGui::GetIO();
 			io.IniFilename = ShaderInjectorIO::imguiSettingsName;
 
-			//NOTE: we did a test here to see if we had fonts (io.Fonts->Fonts.Size), turns out we dont
+			//as in the ImGui 1.92 examples: load a TTF without a fixed size so it is rebaked for
+			//FontSizeBase * FontScaleMain * FontScaleDpi; without one, ImGui picks its embedded default.
+			wchar_t windowsDirectory[MAX_PATH]{};
+			if (GetWindowsDirectoryW(windowsDirectory, MAX_PATH))
+			{
+				const std::string fontPath = ShaderInjectorIO::JoinPath(StringHelper::WideToUtf8(windowsDirectory), "Fonts/segoeui.ttf");
+				if (ShaderInjectorIO::FileExists(fontPath))
+					io.Fonts->AddFontFromFileTTF(fontPath.c_str());
+			}
 
-			//FIX: we forcefully add a font
-			io.Fonts->AddFontDefault();
-
-			unsigned char* pixels = nullptr;
-			int width = 0;
-			int height = 0;
-
-			io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
-
-			//NOTE: another test we did here to confirm if after trying to force add fonts to see if we have fonts, and it looks like it worked
-
-			(void)io;
 			io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 			ImGui::StyleColorsDark();
+			overlayWindow = desc.OutputWindow;
+			overlayFreeDescriptors.clear();
+			for (UINT index = overlayDescriptorCapacity; index > 0; --index) overlayFreeDescriptors.push_back(index - 1);
 
 			if (!ImGui_ImplWin32_Init(desc.OutputWindow))
 			{
@@ -240,11 +274,15 @@ namespace HookD3D12
 				return CallOriginalPresent();
 			}
 
-			const bool imguiDX12Initialized = ImGui_ImplDX12_Init(gDevice, gBufferCount,
-																  desc.BufferDesc.Format, //test: d3d12 desc buffdesc format | format is 24
-																  gHeapSRV,
-																  gHeapSRV->GetCPUDescriptorHandleForHeapStart(),
-																  gHeapSRV->GetGPUDescriptorHandleForHeapStart()); //this also seemingly initalizes fine
+			ImGui_ImplDX12_InitInfo imguiInitialization;
+			imguiInitialization.Device = gDevice;
+			imguiInitialization.CommandQueue = gCommandQueue;
+			imguiInitialization.NumFramesInFlight = static_cast<int>(gBufferCount);
+			imguiInitialization.RTVFormat = desc.BufferDesc.Format;
+			imguiInitialization.SrvDescriptorHeap = gHeapSRV;
+			imguiInitialization.SrvDescriptorAllocFn = AllocateOverlayDescriptor;
+			imguiInitialization.SrvDescriptorFreeFn = FreeOverlayDescriptor;
+			const bool imguiDX12Initialized = ImGui_ImplDX12_Init(&imguiInitialization);
 
 			if (!imguiDX12Initialized)
 			{
@@ -344,7 +382,7 @@ namespace HookD3D12
 			//Render ImGui
 			//Apply MenuScale before NewFrame so font and layout metrics update together on the
 			//frame after the user edits the live scale control.
-			ShaderInjectorGUI::ApplyGUIStyle();
+			ShaderInjectorGUI::ApplyGUIStyle(overlayWindow);
 			ImGui_ImplDX12_NewFrame();	//this seems fine
 			ImGui_ImplWin32_NewFrame(); //this seems fine
 

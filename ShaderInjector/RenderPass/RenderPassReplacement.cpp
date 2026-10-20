@@ -2,6 +2,7 @@
 #include "RenderPass/PipelineFailure.h"
 #include "RenderPass/ReplacementThreadPipelineLookup.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <mutex>
@@ -92,8 +93,48 @@ namespace RenderPassReplacement
 				   ':' + std::to_string(renderPass.fragmentShaderBlobHash);
 		}
 
+		//use the override for a stage when there is one, otherwise the captured bytecode.
+		D3D12_SHADER_BYTECODE SelectStage(
+			const StageOverrides& overrides,
+			ShaderTarget::ShaderType stage,
+			const std::vector<uint8_t>& original,
+			size_t& appliedOverrides)
+		{
+			if (const std::vector<uint8_t>* replacement = overrides.stages[stage])
+			{
+				++appliedOverrides;
+				return {replacement->data(), replacement->size()};
+			}
+			return {DataOrNull(original), original.size()};
+		}
+
+		size_t CountOverrides(const StageOverrides& overrides)
+		{
+			return static_cast<size_t>(std::count_if(overrides.stages.begin(), overrides.stages.end(), [](const auto* stage)
+													 { return stage != nullptr; }));
+		}
+
+		//the captured descriptors keep the game's semantic-name pointers, which may be freed by the time a
+		//pipeline is rebuilt; point them at the copies the capture owns instead.
+		template <typename Pipeline>
+		void CopyOwnedSemanticNames(
+			const Pipeline& pipeline,
+			std::vector<D3D12_INPUT_ELEMENT_DESC>& inputElements,
+			std::vector<D3D12_SO_DECLARATION_ENTRY>& streamOutputDeclarations)
+		{
+			inputElements = pipeline.inputElements;
+			streamOutputDeclarations = pipeline.streamOutputDeclarations;
+			if (pipeline.inputElementSemanticNames.size() == inputElements.size())
+				for (size_t index = 0; index < inputElements.size(); ++index)
+					inputElements[index].SemanticName = pipeline.inputElementSemanticNames[index].c_str();
+			if (pipeline.streamOutputSemanticNames.size() == streamOutputDeclarations.size())
+				for (size_t index = 0; index < streamOutputDeclarations.size(); ++index)
+					streamOutputDeclarations[index].SemanticName = pipeline.streamOutputSemanticNames[index].c_str();
+		}
+
 		ID3D12PipelineState* BuildGraphicsPipeline(
-			const RenderPass::RenderPassDisk& renderPass,
+			const StageOverrides& overrides,
+			ID3D12RootSignature* rootSignature,
 			ID3D12PipelineState* original,
 			std::string& outError)
 		{
@@ -102,18 +143,29 @@ namespace RenderPassReplacement
 				if (pipeline.pipelineState != original)
 					continue;
 
+				std::vector<D3D12_INPUT_ELEMENT_DESC> inputElements;
+				std::vector<D3D12_SO_DECLARATION_ENTRY> streamOutputDeclarations;
+				CopyOwnedSemanticNames(pipeline, inputElements, streamOutputDeclarations);
+				size_t appliedOverrides = 0;
 				D3D12_GRAPHICS_PIPELINE_STATE_DESC description = pipeline.originalDescription;
-				description.VS = {DataOrNull(pipeline.vertexShaderBytecode), pipeline.vertexShaderBytecode.size()};
-				description.PS = {renderPass.fragmentShaderBlob.data(), renderPass.fragmentShaderBlob.size()};
-				description.GS = {DataOrNull(pipeline.geometryShaderBytecode), pipeline.geometryShaderBytecode.size()};
-				description.HS = {DataOrNull(pipeline.hullShaderBytecode), pipeline.hullShaderBytecode.size()};
-				description.DS = {DataOrNull(pipeline.domainShaderBytecode), pipeline.domainShaderBytecode.size()};
-				description.InputLayout = {DataOrNull(pipeline.inputElements), static_cast<UINT>(pipeline.inputElements.size())};
-				description.StreamOutput.pSODeclaration = DataOrNull(pipeline.streamOutputDeclarations);
-				description.StreamOutput.NumEntries = static_cast<UINT>(pipeline.streamOutputDeclarations.size());
+				description.VS = SelectStage(overrides, ShaderTarget::VertexShader, pipeline.vertexShaderBytecode, appliedOverrides);
+				description.PS = SelectStage(overrides, ShaderTarget::PixelShader, pipeline.pixelShaderBytecode, appliedOverrides);
+				description.GS = SelectStage(overrides, ShaderTarget::GeometryShader, pipeline.geometryShaderBytecode, appliedOverrides);
+				description.HS = SelectStage(overrides, ShaderTarget::HullShader, pipeline.hullShaderBytecode, appliedOverrides);
+				description.DS = SelectStage(overrides, ShaderTarget::DomainShader, pipeline.domainShaderBytecode, appliedOverrides);
+				description.InputLayout = {DataOrNull(inputElements), static_cast<UINT>(inputElements.size())};
+				description.StreamOutput.pSODeclaration = DataOrNull(streamOutputDeclarations);
+				description.StreamOutput.NumEntries = static_cast<UINT>(streamOutputDeclarations.size());
 				description.StreamOutput.pBufferStrides = DataOrNull(pipeline.streamOutputStrides);
 				description.StreamOutput.NumStrides = static_cast<UINT>(pipeline.streamOutputStrides.size());
 				description.CachedPSO = {};
+				if (rootSignature)
+					description.pRootSignature = rootSignature;
+
+				//a stage this pipeline does not have (e.g. mesh) belongs to the stream builder.
+				if (appliedOverrides != CountOverrides(overrides))
+					return nullptr;
+
 				ID3D12PipelineState* replacement = nullptr;
 				HookD3D12::ScopedRenderPassInjection injectionScope;
 				HRESULT result = E_NOINTERFACE;
@@ -133,7 +185,8 @@ namespace RenderPassReplacement
 		}
 
 		ID3D12PipelineState* BuildStreamPipeline(
-			const RenderPass::RenderPassDisk& renderPass,
+			const StageOverrides& overrides,
+			ID3D12RootSignature* rootSignature,
 			ID3D12PipelineState* original,
 			std::string& outError)
 		{
@@ -154,34 +207,42 @@ namespace RenderPassReplacement
 			if (rebuildTemplate && !rebuildTemplate->streamBlob.empty())
 			{
 				const auto& pipeline = *rebuildTemplate;
-				D3D12_PIPELINE_STATE_SUBOBJECT_TYPE targetType = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS;
-				if (RenderPass::ResolveExecutionMode(renderPass) == RenderPass::ExecutionMode::Compute)
-					targetType = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS;
+				std::vector<D3D12_INPUT_ELEMENT_DESC> inputElements;
+				std::vector<D3D12_SO_DECLARATION_ENTRY> streamOutputDeclarations;
+				CopyOwnedSemanticNames(pipeline, inputElements, streamOutputDeclarations);
 				std::vector<uint8_t> stream = pipeline.streamBlob;
 				uint8_t* cursor = stream.data();
 				uint8_t* end = cursor + stream.size();
-				bool targetPatched = false;
+				size_t appliedOverrides = 0;
 				bool missingViewInstancingState = false;
 
-				const auto originalShader = [&](D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type) -> const std::vector<uint8_t>*
+				const auto originalShader = [&](D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type, ShaderTarget::ShaderType& stage) -> const std::vector<uint8_t>*
 				{
 					switch (type)
 					{
 					case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
+						stage = ShaderTarget::VertexShader;
 						return &pipeline.vertexShaderBytecode;
 					case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
+						stage = ShaderTarget::PixelShader;
 						return &pipeline.pixelShaderBytecode;
 					case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+						stage = ShaderTarget::ComputeShader;
 						return &pipeline.computeShaderBytecode;
 					case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
+						stage = ShaderTarget::GeometryShader;
 						return &pipeline.geometryShaderBytecode;
 					case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
+						stage = ShaderTarget::HullShader;
 						return &pipeline.hullShaderBytecode;
 					case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
+						stage = ShaderTarget::DomainShader;
 						return &pipeline.domainShaderBytecode;
 					case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS:
+						stage = ShaderTarget::AmplificationShader;
 						return &pipeline.amplificationShaderBytecode;
 					case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS:
+						stage = ShaderTarget::MeshShader;
 						return &pipeline.meshShaderBytecode;
 					default:
 						return nullptr;
@@ -206,32 +267,26 @@ namespace RenderPassReplacement
 
 					void* payload = cursor + sizeof(void*);
 
-					if (const std::vector<uint8_t>* originalBytecode = originalShader(type))
-					{
-						auto* bytecode = static_cast<D3D12_SHADER_BYTECODE*>(payload);
+					ShaderTarget::ShaderType stage = ShaderTarget::Unknown;
 
-						if (type == targetType)
-						{
-							*bytecode = {renderPass.fragmentShaderBlob.data(), renderPass.fragmentShaderBlob.size()};
-							targetPatched = true;
-						}
-						else
-							*bytecode = {DataOrNull(*originalBytecode), originalBytecode->size()};
-					}
+					if (const std::vector<uint8_t>* originalBytecode = originalShader(type, stage))
+						*static_cast<D3D12_SHADER_BYTECODE*>(payload) = SelectStage(overrides, stage, *originalBytecode, appliedOverrides);
 					else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE)
 					{
-						if (pipeline.rootSignature)
+						if (rootSignature)
+							*static_cast<ID3D12RootSignature**>(payload) = rootSignature;
+						else if (pipeline.rootSignature)
 							*static_cast<ID3D12RootSignature**>(payload) = pipeline.rootSignature;
 					}
 					else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO)
 						*static_cast<D3D12_CACHED_PIPELINE_STATE*>(payload) = {};
 					else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT)
-						*static_cast<D3D12_INPUT_LAYOUT_DESC*>(payload) = {DataOrNull(pipeline.inputElements), static_cast<UINT>(pipeline.inputElements.size())};
+						*static_cast<D3D12_INPUT_LAYOUT_DESC*>(payload) = {DataOrNull(inputElements), static_cast<UINT>(inputElements.size())};
 					else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT)
 					{
 						auto* output = static_cast<D3D12_STREAM_OUTPUT_DESC*>(payload);
-						output->pSODeclaration = DataOrNull(pipeline.streamOutputDeclarations);
-						output->NumEntries = static_cast<UINT>(pipeline.streamOutputDeclarations.size());
+						output->pSODeclaration = DataOrNull(streamOutputDeclarations);
+						output->NumEntries = static_cast<UINT>(streamOutputDeclarations.size());
 						output->pBufferStrides = DataOrNull(pipeline.streamOutputStrides);
 						output->NumStrides = static_cast<UINT>(pipeline.streamOutputStrides.size());
 					}
@@ -252,7 +307,7 @@ namespace RenderPassReplacement
 					cursor += subobjectSize;
 				}
 
-				if (!targetPatched || missingViewInstancingState)
+				if (appliedOverrides != CountOverrides(overrides) || missingViewInstancingState)
 				{
 					if (missingViewInstancingState)
 						outError = "The stream PSO is missing durable view-instancing state.";
@@ -281,18 +336,26 @@ namespace RenderPassReplacement
 		}
 
 		ID3D12PipelineState* BuildComputePipeline(
-			const RenderPass::RenderPassDisk& renderPass,
+			const StageOverrides& overrides,
+			ID3D12RootSignature* rootSignature,
 			ID3D12PipelineState* original,
 			std::string& outError)
 		{
+			const std::vector<uint8_t>* computeShader = overrides.stages[ShaderTarget::ComputeShader];
+
+			if (!computeShader || CountOverrides(overrides) != 1)
+				return nullptr;
+
 			for (HookD3D12::ComputePipelineInfo& pipeline : HookD3D12::gComputePipelines)
 			{
 				if (pipeline.pipelineState != original)
 					continue;
 
 				D3D12_COMPUTE_PIPELINE_STATE_DESC description = pipeline.originalDescription;
-				description.CS = {renderPass.fragmentShaderBlob.data(), renderPass.fragmentShaderBlob.size()};
+				description.CS = {computeShader->data(), computeShader->size()};
 				description.CachedPSO = {};
+				if (rootSignature)
+					description.pRootSignature = rootSignature;
 				ID3D12PipelineState* replacement = nullptr;
 				HookD3D12::ScopedRenderPassInjection injectionScope;
 				HRESULT result = E_NOINTERFACE;
@@ -308,6 +371,28 @@ namespace RenderPassReplacement
 			}
 
 			return nullptr;
+		}
+
+		ID3D12PipelineState* BuildPipelineLocked(
+			const StageOverrides& overrides,
+			ID3D12RootSignature* rootSignature,
+			bool computePipeline,
+			ID3D12PipelineState* original,
+			std::string& outError)
+		{
+			ID3D12PipelineState* pipeline = nullptr;
+			if (computePipeline)
+				pipeline = BuildComputePipeline(overrides, rootSignature, original, outError);
+			else
+				pipeline = BuildGraphicsPipeline(overrides, rootSignature, original, outError);
+
+			if (!pipeline)
+				pipeline = BuildStreamPipeline(overrides, rootSignature, original, outError);
+
+			if (!pipeline && outError.empty())
+				outError = "The target PSO has no captured rebuild template for this replacement pass.";
+
+			return pipeline;
 		}
 	} //namespace
 
@@ -350,18 +435,11 @@ namespace RenderPassReplacement
 			return nullptr;
 		}
 
+		const bool computePipeline = RenderPass::ResolveExecutionMode(renderPass) == RenderPass::ExecutionMode::Compute;
+		StageOverrides overrides;
+		overrides.stages[computePipeline ? ShaderTarget::ComputeShader : ShaderTarget::PixelShader] = &renderPass.fragmentShaderBlob;
 		std::lock_guard<std::mutex> pipelineLock(HookD3D12::gPipelineMutex);
-		ID3D12PipelineState* pipeline = nullptr;
-		if (RenderPass::ResolveExecutionMode(renderPass) == RenderPass::ExecutionMode::Compute)
-			pipeline = BuildComputePipeline(renderPass, originalPipelineState, outError);
-		else
-			pipeline = BuildGraphicsPipeline(renderPass, originalPipelineState, outError);
-
-		if (!pipeline)
-			pipeline = BuildStreamPipeline(renderPass, originalPipelineState, outError);
-
-		if (!pipeline && outError.empty())
-			outError = "The target PSO has no captured rebuild template for this replacement pass.";
+		ID3D12PipelineState* pipeline = BuildPipelineLocked(overrides, nullptr, computePipeline, originalPipelineState, outError);
 
 		if (pipeline)
 		{
@@ -377,6 +455,24 @@ namespace RenderPassReplacement
 		}
 
 		return pipeline;
+	}
+
+	ID3D12PipelineState* BuildPipeline(
+		ID3D12PipelineState* original,
+		const StageOverrides& overrides,
+		ID3D12RootSignature* rootSignature,
+		bool computePipeline,
+		std::string& outError)
+	{
+		outError.clear();
+		if (!original || !CountOverrides(overrides))
+		{
+			outError = "Replacement is missing its original PSO or shader bytecode.";
+			return nullptr;
+		}
+
+		std::lock_guard<std::mutex> pipelineLock(HookD3D12::gPipelineMutex);
+		return BuildPipelineLocked(overrides, rootSignature, computePipeline, original, outError);
 	}
 
 	void InvalidateFailedPipelines()

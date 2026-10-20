@@ -27,6 +27,7 @@ namespace Globals
 
 	bool gShowShaderInjectorGUI = true;
 	std::atomic<bool> gShaderInjectorEnabled = true;
+	std::atomic<bool> gShaderPatchesEnabled = true;
 	bool gRenderDocIntegrationEnabled = false;
 	bool gRenderDocAutoAttachEnabled = false;
 	bool gPerformanceTelemetryEnabled = false;

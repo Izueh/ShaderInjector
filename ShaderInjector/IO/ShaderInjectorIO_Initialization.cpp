@@ -17,6 +17,7 @@ namespace ShaderInjectorIO
 		const std::string shaderTargetsDirectory = GetShaderTargetsDirectory();
 		const std::string renderPassesDirectory = GetRenderPassesDirectory();
 		const std::string shaderResourcesDirectory = GetShaderResourcesDirectory();
+		const std::string shaderPatchesDirectory = GetShaderPatchesDirectory();
 		const std::string modifiedShadersDirectory = GetModifiedShadersDirectory();
 		const std::string modifiedShadersIncludesDirectory = GetModifiedShadersIncludesDirectory();
 		const std::string injectorSettingsPath = GetInjectorSettingsPath();
@@ -79,6 +80,27 @@ namespace ShaderInjectorIO
 		{
 			DirectoryCreate(shaderResourcesDirectory);
 			WriteToLogFile("ShaderInjectorIO->Initialize: " + shaderResourcesDirectory + " did not exist; created it.");
+		}
+
+		//seed the recipe tree so a fresh install shows where shader patches belong; the loader tolerates absent folders.
+		if (!DirectoryExists(shaderPatchesDirectory))
+		{
+			DirectoryCreate(shaderPatchesDirectory);
+			WriteToLogFileWarning("ShaderInjectorIO->Initialize: " + shaderPatchesDirectory + " did not exist; created it.");
+		}
+
+		for (const char* model : {"SM5", "SM6"})
+		{
+			const std::string modelDirectory = JoinPath(shaderPatchesDirectory, model);
+
+			for (const char* stage : {"VS", "PS", "CS", "MS"})
+			{
+				//SM5 has no mesh-shader stage.
+				if (model[2] == '5' && stage[0] == 'M')
+					continue;
+
+				DirectoryCreate(JoinPath(modelDirectory, stage));
+			}
 		}
 
 		if (!DirectoryExists(modifiedShadersDirectory))

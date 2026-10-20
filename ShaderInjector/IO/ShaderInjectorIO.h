@@ -76,6 +76,7 @@ namespace ShaderInjectorIO
 	std::string GetShaderTargetsDirectory();
 	std::string GetRenderPassesDirectory();
 	std::string GetShaderResourcesDirectory();
+	std::string GetShaderPatchesDirectory();
 	std::string GetModifiedShadersDirectory();
 	std::string GetModifiedShadersIncludesDirectory();
 	std::string GetShaderConfigurationsPath();

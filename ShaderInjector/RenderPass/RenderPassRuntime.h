@@ -2,6 +2,7 @@
 #include "Enum/RenderPassRuntimeExecutionBoundary.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -9,6 +10,7 @@
 
 #include "RenderPass/RenderPass.h"
 #include "RenderPass/PipelineOutputState.h"
+#include "RenderPass/Runtime/ShaderPatchBinding.h"
 #include "ShaderTarget/ShaderTarget.h"
 
 namespace RenderPassRuntime
@@ -42,8 +44,23 @@ namespace RenderPassRuntime
 		uint64_t shaderTargetHash,
 		ShaderTarget::ShaderType shaderTargetType,
 		const PipelineOutputState& outputState = {});
+	//shader patches that add textures are published with the shader-target bindings and
+	//execute at the same boundaries; a pipeline with a shader-target binding never uses one.
+	void AddShaderPatchBinding(
+		ID3D12PipelineState* pipelineState,
+		std::shared_ptr<const ShaderPatchBinding> binding);
 	void CommitShaderTargetBindingUpdate();
+	//texture recipes need the root-binding hooks even when no render pass is enabled.
+	void SetShaderPatchTrackingRequired(bool required);
+	bool IsShaderPatchTrackingRequired();
+	//classify ExecuteIndirect signatures; unknown signatures are treated as graphics draws that write root arguments.
+	void TrackCommandSignature(ID3D12CommandSignature* commandSignature, const D3D12_COMMAND_SIGNATURE_DESC& description);
+	void FindCommandSignature(ID3D12CommandSignature* commandSignature, bool& outComputeDispatch, bool& outWritesRootArguments);
+	//record the root arguments an ExecuteIndirect reset, so later replays match the game's state.
+	void TrackExecuteIndirect(ID3D12GraphicsCommandList* commandList, ID3D12CommandSignature* commandSignature, bool computePipeline);
 
+	//the root-argument and heap hooks install after the overlay is ready; lists recorded before that are not fully tracked.
+	void NotifyCommandListTrackingHooksInstalled();
 	void ResetCommandList(ID3D12GraphicsCommandList* commandList, ID3D12PipelineState* initialPipelineState);
 	void CompleteCommandListReset(ID3D12GraphicsCommandList* commandList, bool resetSucceeded);
 	void TrackPipelineState(ID3D12GraphicsCommandList* commandList, ID3D12PipelineState* pipelineState);
@@ -105,7 +122,9 @@ namespace RenderPassRuntime
 		const char* operationName,
 		UINT originalThreadGroupCountX = 0,
 		UINT originalThreadGroupCountY = 0,
-		UINT originalThreadGroupCountZ = 0);
+		UINT originalThreadGroupCountZ = 0,
+		bool indirectExecution = false,
+		bool indirectWritesRootArguments = false);
 	void CompleteGraphicsExecutionBoundary(ID3D12GraphicsCommandList* commandList);
 	void CompleteComputeExecutionBoundary(ID3D12GraphicsCommandList* commandList);
 	void NotifyCommandListsSubmitted(

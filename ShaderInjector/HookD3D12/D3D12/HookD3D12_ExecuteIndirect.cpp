@@ -35,7 +35,12 @@ namespace HookD3D12
 			return;
 		}
 
-		if (!IsInjectorEnabledForCommandList(commandList) || !RenderPassRuntime::IsPipelineExecutionTrackingRequired(false) || IsInsideRenderPassInjection())
+		//dispatch signatures use the compute boundary; unknown signatures keep the graphics boundary.
+		bool computeDispatch = false;
+		bool writesRootArguments = true;
+		RenderPassRuntime::FindCommandSignature(commandSignature, computeDispatch, writesRootArguments);
+
+		if (!IsInjectorEnabledForCommandList(commandList) || !RenderPassRuntime::IsPipelineExecutionTrackingRequired(computeDispatch) || IsInsideRenderPassInjection())
 		{
 			Original_ExecuteIndirect(commandList, commandSignature, maximumCommandCount, argumentBuffer, argumentBufferOffset, countBuffer, countBufferOffset);
 			return;
@@ -46,21 +51,24 @@ namespace HookD3D12
 		uint32_t boundaryMask = 0;
 		{
 			PerformanceMetrics::ScopedTimer lookupTimer(PerformanceMetrics::Timing::ExecutionHookLookup, 512);
-			boundaryMask = RenderPassRuntime::GetExecutionBoundaryMask(commandList, false);
+			boundaryMask = RenderPassRuntime::GetExecutionBoundaryMask(commandList, computeDispatch);
 		}
 
 		if (boundaryMask)
 			PerformanceMetrics::Increment(PerformanceMetrics::Counter::ExecutionBoundaryCandidate);
 
 		if ((boundaryMask & 1u) != 0)
-			RenderPassRuntime::RecordExecutionBoundary(commandList, false, RenderPassRuntime::ExecutionBoundary::Before, "ExecuteIndirect");
+			RenderPassRuntime::RecordExecutionBoundary(commandList, computeDispatch, RenderPassRuntime::ExecutionBoundary::Before, "ExecuteIndirect", 0, 0, 0, true, writesRootArguments);
 
 		Original_ExecuteIndirect(commandList, commandSignature, maximumCommandCount, argumentBuffer, argumentBufferOffset, countBuffer, countBufferOffset);
+		RenderPassRuntime::TrackExecuteIndirect(commandList, commandSignature, computeDispatch);
 
-		if ((boundaryMask & 1u) != 0)
+		if ((boundaryMask & 1u) != 0 && computeDispatch)
+			RenderPassRuntime::CompleteComputeExecutionBoundary(commandList);
+		else if ((boundaryMask & 1u) != 0)
 			RenderPassRuntime::CompleteGraphicsExecutionBoundary(commandList);
 
 		if ((boundaryMask & 2u) != 0)
-			RenderPassRuntime::RecordExecutionBoundary(commandList, false, RenderPassRuntime::ExecutionBoundary::After, "ExecuteIndirect");
+			RenderPassRuntime::RecordExecutionBoundary(commandList, computeDispatch, RenderPassRuntime::ExecutionBoundary::After, "ExecuteIndirect", 0, 0, 0, true, writesRootArguments);
 	}
 } //namespace HookD3D12

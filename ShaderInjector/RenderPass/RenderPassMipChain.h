@@ -36,6 +36,11 @@ namespace RenderPassMipChain
 		ID3D12GraphicsCommandList* commandList,
 		const GraphicsStateSnapshot& gameState,
 		bool computePipeline);
+	void RestoreRootArguments(
+		ID3D12GraphicsCommandList* commandList,
+		const GraphicsStateSnapshot& gameState,
+		bool computePipeline,
+		bool includeDescriptorTables);
 	bool HasRecordedCommandListWork();
 	void ResetCommandListRecording(ID3D12GraphicsCommandList* commandList);
 	void NotifyCommandListsSubmitted(

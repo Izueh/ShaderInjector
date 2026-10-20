@@ -37,6 +37,9 @@
     <Filter Include="RenderDoc">
       <UniqueIdentifier>{3c7c7dfe-a91a-446e-99a9-5307cb42be22}</UniqueIdentifier>
     </Filter>
+    <Filter Include="ShaderPatch">
+      <UniqueIdentifier>{7d0c1f52-5a4e-4c55-9e0b-5a0d7c3e9b41}</UniqueIdentifier>
+    </Filter>
     <Filter Include="RenderPass">
       <UniqueIdentifier>{f505d4fd-aaf2-4a84-b145-25570e067cbd}</UniqueIdentifier>
     </Filter>
@@ -81,6 +84,24 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="RenderPass\Runtime\ShaderPatchBinding.h">
+      <Filter>RenderPass</Filter>
+    </ClInclude>
+    <ClInclude Include="RenderPass\RenderPassExpandedRootSignature.h">
+      <Filter>RenderPass</Filter>
+    </ClInclude>
+    <ClInclude Include="ShaderPatch\ShaderPatchCache.h">
+      <Filter>ShaderPatch</Filter>
+    </ClInclude>
+    <ClInclude Include="ShaderResource\Runtime\DescriptorHeapReserve.h">
+      <Filter>ShaderResource\Runtime</Filter>
+    </ClInclude>
+    <ClInclude Include="ShaderPatch\ShaderPatchRuntime.h">
+      <Filter>ShaderPatch</Filter>
+    </ClInclude>
+    <ClInclude Include="ShaderPatch\Recipe.h">
+      <Filter>ShaderPatch</Filter>
+    </ClInclude>
     <ClInclude Include="dsound_proxy.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -803,6 +824,30 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="HookD3D12\D3D12\HookD3D12_CreateCommandSignature.cpp">
+      <Filter>D3D12</Filter>
+    </ClCompile>
+    <ClCompile Include="RenderPass\RenderPassExpandedRootSignature.cpp">
+      <Filter>RenderPass</Filter>
+    </ClCompile>
+    <ClCompile Include="GUI\ShaderInjectorGUI_ShaderPatches.cpp">
+      <Filter>GUI</Filter>
+    </ClCompile>
+    <ClCompile Include="ShaderPatch\ShaderPatchDump.cpp">
+      <Filter>ShaderPatch</Filter>
+    </ClCompile>
+    <ClCompile Include="ShaderPatch\ShaderPatchCache.cpp">
+      <Filter>ShaderPatch</Filter>
+    </ClCompile>
+    <ClCompile Include="ShaderResource\Runtime\DescriptorHeapReserve.cpp">
+      <Filter>ShaderResource\Runtime</Filter>
+    </ClCompile>
+    <ClCompile Include="ShaderPatch\ShaderPatchRuntime.cpp">
+      <Filter>ShaderPatch</Filter>
+    </ClCompile>
+    <ClCompile Include="ShaderPatch\Recipe.cpp">
+      <Filter>ShaderPatch</Filter>
+    </ClCompile>
     <ClCompile Include="dllmain.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>

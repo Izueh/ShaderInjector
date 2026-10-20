@@ -45,6 +45,9 @@ namespace VTableIndex
 	constexpr size_t indexCopyDescriptors = 23;
 	constexpr size_t indexCopyDescriptorsSimple = 24;
 
+	//ID3D12Device::CreateCommandSignature
+	constexpr size_t indexCreateCommandSignature = 41;
+
 	//ID3D12Device resource creation methods
 	constexpr size_t indexCreateCommittedResource = 27;
 	constexpr size_t indexCreatePlacedResource = 29;

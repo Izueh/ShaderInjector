@@ -24,6 +24,7 @@ namespace ShaderInjectorIO
 	static const char* const settingsNameInjectorEnabled = "InjectorEnabled";
 	static const char* const settingsNameMenuOpen = "MenuOpen";
 	static const char* const settingsNameMenuScale = "MenuScale";
+	static const char* const settingsNameShaderPatchesEnabled = "ShaderPatchesEnabled";
 
 	static const char* const settingsNameVertexShaderModel = "VertexShaderModel";
 	static const char* const settingsNameAutoDetectShaderModels = "AutoDetectShaderModels";
@@ -79,6 +80,7 @@ namespace ShaderInjectorIO
 		injectorSettingsINI[settingsSectionInjector][settingsNameInjectorEnabled] = Globals::gShaderInjectorEnabled.load(std::memory_order_acquire);
 		injectorSettingsINI[settingsSectionInjector][settingsNameMenuOpen] = Globals::gShowShaderInjectorGUI;
 		injectorSettingsINI[settingsSectionInjector][settingsNameMenuScale] = static_cast<double>(Globals::gShaderInjectorGUIScale);
+		injectorSettingsINI[settingsSectionInjector][settingsNameShaderPatchesEnabled] = Globals::gShaderPatchesEnabled.load(std::memory_order_acquire);
 
 		//keep shader model choices together because the compiler reads them as one configuration group.
 		injectorSettingsINI[settingsSectionShaderCompiler][settingsNameVertexShaderModel] = static_cast<int>(Globals::gVertexShaderModel);
@@ -134,6 +136,7 @@ namespace ShaderInjectorIO
 			const bool shaderInjectorEnabled = ReadIniValueOrDefault(injectorSettingsINI, settingsSectionInjector, settingsNameInjectorEnabled, Globals::gShaderInjectorEnabled.load(std::memory_order_acquire));
 			const bool showShaderInjectorGUI = ReadIniValueOrDefault(injectorSettingsINI, settingsSectionInjector, settingsNameMenuOpen, Globals::gShowShaderInjectorGUI);
 			const double shaderInjectorGUIScale = ReadIniValueOrDefault(injectorSettingsINI, settingsSectionInjector, settingsNameMenuScale, static_cast<double>(Globals::gShaderInjectorGUIScale));
+			const bool shaderPatchesEnabled = ReadIniValueOrDefault(injectorSettingsINI, settingsSectionInjector, settingsNameShaderPatchesEnabled, Globals::gShaderPatchesEnabled.load(std::memory_order_acquire));
 
 			//read capture integration settings as a pair.
 			const bool renderDocIntegrationEnabled = ReadIniValueOrDefault(injectorSettingsINI, settingsSectionRenderDoc, settingsNameEnabled, Globals::gRenderDocIntegrationEnabled);
@@ -172,6 +175,7 @@ namespace ShaderInjectorIO
 			Globals::gShaderInjectorEnabled.store(shaderInjectorEnabled, std::memory_order_release);
 			Globals::gShowShaderInjectorGUI = showShaderInjectorGUI;
 			Globals::gShaderInjectorGUIScale = static_cast<float>((std::clamp)(shaderInjectorGUIScale, 0.5, 4.0));
+			Globals::gShaderPatchesEnabled.store(shaderPatchesEnabled, std::memory_order_release);
 
 			//apply the remaining groups after all of their values have been read.
 			Globals::gRenderDocIntegrationEnabled = renderDocIntegrationEnabled;

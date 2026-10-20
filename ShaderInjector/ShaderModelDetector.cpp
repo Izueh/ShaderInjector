@@ -195,6 +195,11 @@ namespace ShaderModelDetector
 		}
 	} //namespace
 
+	bool TryReadShaderModel(ShaderTarget::ShaderType expectedShaderType, const void* bytecode, size_t size, Globals::ShaderModel& shaderModel)
+	{
+		return TryDetectShaderModel(expectedShaderType, bytecode, size, shaderModel);
+	}
+
 	void ObserveShaderBytecode(
 		ShaderTarget::ShaderType expectedShaderType,
 		const void* shaderBytecode,

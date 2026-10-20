@@ -7,6 +7,8 @@
 
 namespace ShaderModelDetector
 {
+	bool TryReadShaderModel(ShaderTarget::ShaderType expectedShaderType, const void* bytecode, size_t size, Globals::ShaderModel& shaderModel);
+
 	//Records the shader model encoded in an original DXBC or DXIL container.
 	//This is intentionally allocation-free because it runs from PSO creation hooks.
 	void ObserveShaderBytecode(

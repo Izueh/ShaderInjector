@@ -8,6 +8,8 @@
 #include "Hash/Hash.h"
 #include "ShaderDiscovery/ShaderAutomaticDiscovery.h"
 #include "ShaderModelDetector.h"
+#include "ShaderPatch/ShaderPatchRuntime.h"
+#include "StringHelper.h"
 
 namespace HookD3D12
 {
@@ -118,6 +120,11 @@ namespace HookD3D12
 		if (pipelineDescription->InputLayout.pInputElementDescs && pipelineDescription->InputLayout.NumElements > 0)
 		{
 			capturedGraphicsPipeline.inputElements.assign(pipelineDescription->InputLayout.pInputElementDescs, pipelineDescription->InputLayout.pInputElementDescs + pipelineDescription->InputLayout.NumElements);
+
+			//own the semantic strings so later rebuilds never read the caller's freed memory.
+			capturedGraphicsPipeline.inputElementSemanticNames.reserve(capturedGraphicsPipeline.inputElements.size());
+			for (const D3D12_INPUT_ELEMENT_DESC& element : capturedGraphicsPipeline.inputElements)
+				capturedGraphicsPipeline.inputElementSemanticNames.push_back(StringHelper::SafeString(element.SemanticName));
 			capturedGraphicsPipeline.originalDescription.InputLayout.pInputElementDescs = capturedGraphicsPipeline.inputElements.data();
 			capturedGraphicsPipeline.originalDescription.InputLayout.NumElements = static_cast<UINT>(capturedGraphicsPipeline.inputElements.size());
 		}
@@ -131,6 +138,10 @@ namespace HookD3D12
 		if (pipelineDescription->StreamOutput.pSODeclaration && pipelineDescription->StreamOutput.NumEntries > 0)
 		{
 			capturedGraphicsPipeline.streamOutputDeclarations.assign(pipelineDescription->StreamOutput.pSODeclaration, pipelineDescription->StreamOutput.pSODeclaration + pipelineDescription->StreamOutput.NumEntries);
+
+			capturedGraphicsPipeline.streamOutputSemanticNames.reserve(capturedGraphicsPipeline.streamOutputDeclarations.size());
+			for (const D3D12_SO_DECLARATION_ENTRY& element : capturedGraphicsPipeline.streamOutputDeclarations)
+				capturedGraphicsPipeline.streamOutputSemanticNames.push_back(StringHelper::SafeString(element.SemanticName));
 			capturedGraphicsPipeline.originalDescription.StreamOutput.pSODeclaration = capturedGraphicsPipeline.streamOutputDeclarations.data();
 		}
 		else
@@ -160,6 +171,8 @@ namespace HookD3D12
 			gGraphicsPipelines.push_back(capturedGraphicsPipeline);
 			QueueShaderTargetApplyWork();
 		}
+
+		ShaderPatchRuntime::NotifyPipelineCreated(capturedGraphicsPipeline.pipelineState);
 
 		//run discovery after the durable capture has been registered.
 		if (gRuntimeReady.load(std::memory_order_acquire))

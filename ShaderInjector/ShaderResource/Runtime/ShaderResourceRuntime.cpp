@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -45,6 +46,9 @@ namespace ShaderResourceRuntime
 
 		std::mutex gTextureMutex;
 		std::unordered_map<ID3D12Device*, std::unordered_map<std::string, std::unique_ptr<TextureGPU>>> gTextures;
+		//replaced textures stay alive: recorded command lists and descriptor copies may still reference them.
+		std::vector<std::unique_ptr<TextureGPU>> gRetiredTextures;
+		std::atomic<uint64_t> gTextureGeneration = 0;
 		std::mutex gCommandListSlotMutex;
 		std::unordered_map<ID3D12GraphicsCommandList*, std::unique_ptr<CommandListSlot>> gCommandListSlots;
 		std::unordered_map<ID3D12CommandQueue*, QueueFence> gQueueFences;
@@ -879,6 +883,14 @@ namespace ShaderResourceRuntime
 		CommandListSlot& slot = GetCommandListSlot(commandList);
 		const bool bindingBatchActive = gResourceBindingBatchCommandList == commandList;
 
+		//a texture reload replaced or removed textures this slot may still point at.
+		const uint64_t textureGeneration = gTextureGeneration.load(std::memory_order_acquire);
+		if (slot.resolvedTextureGeneration != textureGeneration)
+		{
+			slot.resolvedTextures.clear();
+			slot.resolvedTextureGeneration = textureGeneration;
+		}
+
 		if (!bindingBatchActive)
 		{
 			slot.resourceTablePool.Reset();
@@ -1533,6 +1545,161 @@ namespace ShaderResourceRuntime
 	void ScopedResourceBindingBatch::KeepResourcesForOriginalDraw()
 	{
 		keepResourcesForOriginalDraw = true;
+	}
+
+	void LoadTextures(ID3D12Device* device)
+	{
+		if (!device)
+			return;
+
+		const std::vector<ShaderResource::TextureDisk> disks = DatabaseShaderResources::CopyShaderResources();
+		std::vector<const ShaderResource::TextureDisk*> pending;
+		{
+			std::lock_guard<std::mutex> lock(gTextureMutex);
+			const auto deviceTextures = gTextures.find(device);
+			std::unordered_set<std::string> pendingIds;
+			for (const ShaderResource::TextureDisk& disk : disks)
+			{
+				//each texture is created and transitioned once; a second barrier would name the wrong state.
+				if (!disk.validationError.empty() || !pendingIds.insert(disk.id).second)
+					continue;
+				if (deviceTextures != gTextures.end())
+				{
+					const auto existing = deviceTextures->second.find(disk.id);
+					if (existing != deviceTextures->second.end() && existing->second->texture)
+						continue;
+				}
+				pending.push_back(&disk);
+			}
+		}
+		if (pending.empty())
+			return;
+
+		//one private queue submission for every texture, waited for here, so no game command list records an upload.
+		HookD3D12::ScopedRenderPassInjection injectionScope;
+		D3D12_COMMAND_QUEUE_DESC queueDescription{};
+		queueDescription.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+		ComPtr<ID3D12CommandQueue> queue;
+		ComPtr<ID3D12CommandAllocator> allocator;
+		ComPtr<ID3D12GraphicsCommandList> commandList;
+		ComPtr<ID3D12Fence> fence;
+		if (FAILED(device->CreateCommandQueue(&queueDescription, IID_PPV_ARGS(&queue))) ||
+			FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
+			FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&commandList))) ||
+			FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))
+		{
+			ShaderInjectorIO::WriteToLogFileError("ShaderResourceRuntime->LoadTextures: could not create the DDS upload queue");
+			return;
+		}
+
+		std::vector<TextureGPU*> textures;
+		for (const ShaderResource::TextureDisk* disk : pending)
+		{
+			std::string error;
+			//a render pass may have created it meanwhile, with its upload in a game command list.
+			{
+				std::lock_guard<std::mutex> lock(gTextureMutex);
+				const auto existing = gTextures[device].find(disk->id);
+				if (existing != gTextures[device].end() && existing->second->texture)
+					continue;
+			}
+			TextureGPU* texture = GetOrCreateTexture(device, commandList.Get(), *disk, error);
+			if (!texture)
+			{
+				ShaderInjectorIO::WriteToLogFileWarning("ShaderResourceRuntime->LoadTextures: " + error);
+				continue;
+			}
+
+			//the upload leaves the texture in a pixel/non-pixel shader-resource state; COMMON promotes on any queue.
+			D3D12_RESOURCE_BARRIER barrier{};
+			barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			barrier.Transition.pResource = texture->texture.Get();
+			barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+			barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+			commandList->ResourceBarrier(1, &barrier);
+
+			std::error_code fileError;
+			const std::filesystem::path path = ShaderInjectorIO::PathFromUTF8(disk->filePath);
+			texture->fileTime = static_cast<uint64_t>(std::filesystem::last_write_time(path, fileError).time_since_epoch().count());
+			texture->fileSize = static_cast<uint64_t>(std::filesystem::file_size(path, fileError));
+			textures.push_back(texture);
+		}
+
+		if (FAILED(commandList->Close()))
+		{
+			ShaderInjectorIO::WriteToLogFileError("ShaderResourceRuntime->LoadTextures: could not close the DDS upload list");
+			return;
+		}
+
+		ID3D12CommandList* lists[] = {commandList.Get()};
+		queue->ExecuteCommandLists(1, lists);
+		HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+		const bool signalled = event && SUCCEEDED(queue->Signal(fence.Get(), 1)) && SUCCEEDED(fence->SetEventOnCompletion(1, event));
+		if (signalled)
+			WaitForSingleObject(event, INFINITE);
+		if (event)
+			CloseHandle(event);
+		if (!signalled || fence->GetCompletedValue() < 1)
+		{
+			ShaderInjectorIO::WriteToLogFileError("ShaderResourceRuntime->LoadTextures: the DDS upload did not complete");
+			return;
+		}
+
+		std::lock_guard<std::mutex> lock(gTextureMutex);
+		for (TextureGPU* texture : textures)
+		{
+			texture->upload.Reset();
+			texture->uploaded = true;
+		}
+	}
+
+	void ReloadTextures()
+	{
+		DatabaseShaderResources::RefreshShaderResources();
+
+		//retire textures whose file changed or disappeared; LoadTextures then uploads the new and changed ones.
+		std::vector<ID3D12Device*> devices;
+		{
+			std::lock_guard<std::mutex> lock(gTextureMutex);
+			for (auto& [device, textures] : gTextures)
+			{
+				devices.push_back(device);
+				for (auto texture = textures.begin(); texture != textures.end();)
+				{
+					const ShaderResource::TextureDisk* disk = DatabaseShaderResources::FindShaderResourceById(texture->first);
+					std::error_code fileError;
+					const std::filesystem::path path = disk ? ShaderInjectorIO::PathFromUTF8(disk->filePath) : std::filesystem::path();
+					const bool unchanged = disk && disk->validationError.empty() && texture->second->uploaded &&
+										   texture->second->fileTime == static_cast<uint64_t>(std::filesystem::last_write_time(path, fileError).time_since_epoch().count()) &&
+										   texture->second->fileSize == static_cast<uint64_t>(std::filesystem::file_size(path, fileError));
+					if (unchanged)
+					{
+						++texture;
+						continue;
+					}
+					gRetiredTextures.push_back(std::move(texture->second));
+					texture = textures.erase(texture);
+				}
+			}
+		}
+
+		for (ID3D12Device* device : devices)
+			LoadTextures(device);
+		gTextureGeneration.fetch_add(1, std::memory_order_acq_rel);
+	}
+
+	bool FindTextureShaderResourceView(ID3D12Device* device, const std::string& resourceId, D3D12_CPU_DESCRIPTOR_HANDLE& outShaderResourceView)
+	{
+		std::lock_guard<std::mutex> lock(gTextureMutex);
+		const auto deviceTextures = gTextures.find(device);
+		if (deviceTextures == gTextures.end())
+			return false;
+		const auto texture = deviceTextures->second.find(resourceId);
+		if (texture == deviceTextures->second.end() || !texture->second->uploaded)
+			return false;
+		outShaderResourceView = texture->second->shaderResourceViewHeap->GetCPUDescriptorHandleForHeapStart();
+		return true;
 	}
 
 	void RestoreResources(ID3D12GraphicsCommandList* commandList)

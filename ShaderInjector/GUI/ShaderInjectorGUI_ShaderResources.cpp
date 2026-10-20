@@ -8,6 +8,7 @@
 
 #include "IO/ShaderInjectorIO.h"
 #include "ShaderResource/DatabaseShaderResources.h"
+#include "ShaderResource/Runtime/ShaderResourceRuntime.h"
 #include "ShaderResource/ShaderResourceCatalog.h"
 
 namespace ShaderInjectorGUI
@@ -26,7 +27,7 @@ namespace ShaderInjectorGUI
 
 		if (ImGui::Button("Refresh##ShaderResources"))
 		{
-			DatabaseShaderResources::RefreshShaderResources();
+			ShaderResourceRuntime::ReloadTextures();
 			resources = ShaderResourceCatalog::GetSnapshot();
 		}
 

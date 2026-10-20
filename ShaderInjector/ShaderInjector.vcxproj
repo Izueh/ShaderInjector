@@ -42,13 +42,13 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>v143</PlatformToolset>
+    <PlatformToolset>v145</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>v143</PlatformToolset>
+    <PlatformToolset>v145</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
@@ -155,7 +155,8 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
       <ModuleDefinitionFile>$(ProjectDir)exports.def</ModuleDefinitionFile>
-      <AdditionalDependencies>d3d12.lib;dxgi.lib;$(ProjectDir)ExternalDependencies\MinHook_134\lib\libMinHook.x64.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d12.lib;dxgi.lib;dxpatcher.lib;$(ProjectDir)ExternalDependencies\MinHook_134\lib\Release\libMinHook.x64.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(DxpDir)x64\Release\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <ControlFlowGuard>Guard</ControlFlowGuard>
       <RandomizedBaseAddress>true</RandomizedBaseAddress>
       <DataExecutionPrevention>true</DataExecutionPrevention>
@@ -168,6 +169,11 @@
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="RenderPass\Runtime\ShaderPatchBinding.h" />
+    <ClInclude Include="RenderPass\RenderPassExpandedRootSignature.h" />
+    <ClInclude Include="ShaderPatch\ShaderPatchCache.h" />
+    <ClInclude Include="ShaderResource\Runtime\DescriptorHeapReserve.h" />
+    <ClInclude Include="ShaderPatch\ShaderPatchRuntime.h" />
     <ClInclude Include="Enum\EnumStrings.h" />
     <ClInclude Include="Enum\ShaderTargetApplyResult.h" />
     <ClInclude Include="Enum\ShaderAutomaticDiscoveryPipelineSource.h" />
@@ -440,8 +446,16 @@
     <ClInclude Include="ShaderTemplates.h" />
     <ClInclude Include="StringHelper.h" />
     <ClInclude Include="VTableIndex.h" />
+    <ClInclude Include="ShaderPatch\Recipe.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="HookD3D12\D3D12\HookD3D12_CreateCommandSignature.cpp" />
+    <ClCompile Include="RenderPass\RenderPassExpandedRootSignature.cpp" />
+    <ClCompile Include="GUI\ShaderInjectorGUI_ShaderPatches.cpp" />
+    <ClCompile Include="ShaderPatch\ShaderPatchDump.cpp" />
+    <ClCompile Include="ShaderPatch\ShaderPatchCache.cpp" />
+    <ClCompile Include="ShaderResource\Runtime\DescriptorHeapReserve.cpp" />
+    <ClCompile Include="ShaderPatch\ShaderPatchRuntime.cpp" />
     <ClCompile Include="Database\DatabaseGraphicsPSOs.cpp" />
     <ClCompile Include="Database\DatabaseComputePSOs.cpp" />
     <ClCompile Include="Database\DatabaseStreamPSOs.cpp" />
@@ -599,6 +613,10 @@
     <ClCompile Include="ShaderTemplates.cpp" />
     <ClCompile Include="StringHelper.cpp" />
     <ClCompile Include="Enum\EnumStrings.cpp" />
+    <ClCompile Include="ShaderPatch\Recipe.cpp">
+      <LanguageStandard>stdcpplatest</LanguageStandard>
+      <AdditionalIncludeDirectories>$(DxpDir)x64\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="ShaderInjector.rc" />
@@ -608,6 +626,28 @@
     <None Include="Build\RELEASE_SECURITY.md" />
     <None Include="Build\Signing.md" />
   </ItemGroup>
+  <!--the DXP static SDK is too large to commit; it is downloaded from the pinned release once per version.-->
+  <PropertyGroup>
+    <DxpVersion>0.8.2</DxpVersion>
+    <DxpAsset>DirectXShaderPatcher-ninja-x64-static.zip</DxpAsset>
+    <DxpReleaseUrl>https://github.com/Izueh/DirectXShaderPatcher/releases/download/v$(DxpVersion)</DxpReleaseUrl>
+    <DxpDir>$(MSBuildProjectDirectory)\packages\DirectXShaderPatcher\$(DxpVersion)\</DxpDir>
+    <DxpDownloadDir>$(MSBuildProjectDirectory)\packages\DirectXShaderPatcher\download\</DxpDownloadDir>
+    <DxpInstalledMarker>$(DxpDir)$(DxpAsset).sha256</DxpInstalledMarker>
+  </PropertyGroup>
+  <Target Name="DownloadDirectXShaderPatcher" BeforeTargets="ClCompile" Condition="'$(Configuration)|$(Platform)'=='Release|x64' And !Exists('$(DxpInstalledMarker)')">
+    <DownloadFile SourceUrl="$(DxpReleaseUrl)/SHA256SUMS" DestinationFolder="$(DxpDownloadDir)" />
+    <DownloadFile SourceUrl="$(DxpReleaseUrl)/$(DxpAsset)" DestinationFolder="$(DxpDownloadDir)" />
+    <PropertyGroup>
+      <DxpSha256>$([System.Text.RegularExpressions.Regex]::Match($([System.IO.File]::ReadAllText('$(DxpDownloadDir)SHA256SUMS')), '(?m)^[0-9a-fA-F]{64}(?=\s+\*?$([System.Text.RegularExpressions.Regex]::Escape('$(DxpAsset)'))\s*$)'))</DxpSha256>
+    </PropertyGroup>
+    <Error Condition="'$(DxpSha256)'==''" Text="DXP v$(DxpVersion) SHA256SUMS has no entry for $(DxpAsset)." />
+    <VerifyFileHash File="$(DxpDownloadDir)$(DxpAsset)" Algorithm="SHA256" Hash="$(DxpSha256)" />
+    <RemoveDir Directories="$(DxpDir)" />
+    <Unzip SourceFiles="$(DxpDownloadDir)$(DxpAsset)" DestinationFolder="$(DxpDir)" Include="x64/include/**;x64/Release/lib/**" />
+    <WriteLinesToFile File="$(DxpInstalledMarker)" Lines="$(DxpSha256)" Overwrite="true" />
+    <RemoveDir Directories="$(DxpDownloadDir)" />
+  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />
 </Project>

@@ -92,6 +92,9 @@ namespace HookD3D12
 		MH_STATUS statusRootSignatureCreate = MH_CreateHook(deviceVTable[VTableIndex::indexCreateRootSignature], &Hook_CreateRootSignature, reinterpret_cast<void**>(&Original_CreateRootSignature));
 		MH_STATUS statusRootSignatureEnable = MH_EnableHook(deviceVTable[VTableIndex::indexCreateRootSignature]);
 
+		MH_STATUS statusCommandSignatureCreate = MH_CreateHook(deviceVTable[VTableIndex::indexCreateCommandSignature], &Hook_CreateCommandSignature, reinterpret_cast<void**>(&Original_CreateCommandSignature));
+		MH_STATUS statusCommandSignatureEnable = MH_EnableHook(deviceVTable[VTableIndex::indexCreateCommandSignature]);
+
 		ID3D12Device2* device2 = nullptr;
 
 		if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device2))))
@@ -140,6 +143,11 @@ namespace HookD3D12
 			ShaderInjectorGUI::WriteToRuntimeLog("HookD3D12Install->InstallPipelineHooksForDevice: CreateRootSignature hook installed");
 		else
 			ShaderInjectorGUI::WriteToRuntimeLogError("HookD3D12Install->InstallPipelineHooksForDevice: CreateRootSignature hook failed");
+
+		if (statusCommandSignatureCreate == MH_OK && statusCommandSignatureEnable == MH_OK)
+			ShaderInjectorGUI::WriteToRuntimeLog("HookD3D12Install->InstallPipelineHooksForDevice: CreateCommandSignature hook installed");
+		else
+			ShaderInjectorGUI::WriteToRuntimeLogError("HookD3D12Install->InstallPipelineHooksForDevice: CreateCommandSignature hook failed");
 	}
 
 	static void InstallMeshDispatchHookForCommandList(ID3D12GraphicsCommandList* commandList)
@@ -294,7 +302,8 @@ namespace HookD3D12
 
 	void InstallDeferredRenderPassHooks(ID3D12Device* device)
 	{
-		if (!device || !capturedGraphicsCommandListVTable || !RenderPassRuntime::HasEnabledRenderPasses())
+		if (!device || !capturedGraphicsCommandListVTable ||
+			(!RenderPassRuntime::HasEnabledRenderPasses() && !RenderPassRuntime::IsShaderPatchTrackingRequired()))
 			return;
 
 		void** initialDeviceVTable = *reinterpret_cast<void***>(device);
@@ -399,6 +408,7 @@ namespace HookD3D12
 			if (commandListHooksInstalled)
 			{
 				renderPassHookedCommandListVTables.insert(commandListVTableKey);
+				RenderPassRuntime::NotifyCommandListTrackingHooksInstalled();
 				ShaderInjectorIO::WriteToLogFileSuccess(StringHelper::Format("HookD3D12Install->InstallDeferredRenderPassHooks: command-list hooks installed after overlay readiness vtable = %p", commandListVTable));
 			}
 			else

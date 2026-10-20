@@ -11,6 +11,7 @@
 
 //3RD Party
 #include "imgui.h"
+#include "imgui_impl_win32.h"
 
 //custom
 #include "HookD3D12.h"
@@ -31,7 +32,7 @@
 
 namespace ShaderInjectorGUI
 {
-	void ApplyGUIStyle()
+	void ApplyGUIStyle(HWND window)
 	{
 		ImGuiStyle& imguiStyle = ImGui::GetStyle();
 		imguiStyle = ImGuiStyle();
@@ -124,7 +125,10 @@ namespace ShaderInjectorGUI
 		//Rebuild the style from an unscaled baseline every frame so live scale changes never
 		//compound the previous frame's dimensions.
 		const float menuScale = (std::clamp)(Globals::gShaderInjectorGUIScale, 0.5f, 4.0f);
-		imguiStyle.ScaleAllSizes(menuScale);
+		const float dpiScale = window ? ImGui_ImplWin32_GetDpiScaleForHwnd(window) : 1.0f;
+		imguiStyle.ScaleAllSizes(menuScale * dpiScale);
+		imguiStyle.FontSizeBase = 18.0f;
 		imguiStyle.FontScaleMain = menuScale;
+		imguiStyle.FontScaleDpi = dpiScale;
 	}
 } //namespace ShaderInjectorGUI

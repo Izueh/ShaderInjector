@@ -337,6 +337,13 @@ namespace HookD3D12
 
 	extern HRESULT STDMETHODCALLTYPE Hook_CreateRootSignature(ID3D12Device* device, UINT nodeMask, const void* blobWithRootSignature, SIZE_T blobLengthInBytes, REFIID riid, void** rootSignature);
 
+	//Record which command signatures rewrite root arguments during ExecuteIndirect.
+	using FunctionCreateCommandSignatureD3D12 = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMMAND_SIGNATURE_DESC*, ID3D12RootSignature*, REFIID, void**);
+
+	extern FunctionCreateCommandSignatureD3D12 Original_CreateCommandSignature;
+
+	HRESULT STDMETHODCALLTYPE Hook_CreateCommandSignature(ID3D12Device* device, const D3D12_COMMAND_SIGNATURE_DESC* description, ID3D12RootSignature* rootSignature, REFIID interfaceId, void** commandSignature);
+
 	//Capture graphics pipeline descriptors and shader bytecode.
 	using FunctionCreateGraphicsPipelineStateD3D12 = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*, REFIID, void**);
 

@@ -32,6 +32,7 @@ namespace ShaderResourceRuntime
 		std::unordered_map<uint64_t, std::vector<RenderPassResourceRegistry::DescriptorBindingLocation>> graphicsBindingLocations;
 		std::unordered_map<uint64_t, std::vector<RenderPassResourceRegistry::DescriptorBindingLocation>> computeBindingLocations;
 		std::unordered_map<std::string, TextureGPU*> resolvedTextures;
+		uint64_t resolvedTextureGeneration = 0;
 		std::vector<ID3D12DescriptorHeap*> restoreHeaps;
 		std::vector<RootTableRestore> restoreRootTables;
 		std::vector<std::unique_ptr<DescriptorExecutionSlot>> executionSlots;

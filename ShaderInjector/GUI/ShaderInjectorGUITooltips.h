@@ -58,6 +58,21 @@ namespace ShaderInjectorGUI
 	static const char* tooltipCreateModifiedShaderTemplate =
 		"Creates a Modified Shader package containing template HLSL and shader-discovery metadata for the selected shader.";
 
+	static const char* noteShaderPatchesText =
+		"Shader patches apply runtime shader modifications to captured pipelines without recompiling the game's shaders. "
+		"Recipes live in 'ShaderInjector/ShaderPatches' under SM5/SM6 model folders and optional VS/PS/CS/MS stage folders. "
+		"Recipes that sample added DDS textures need matching entries in 'ShaderInjector/ShaderResources'. "
+		"Editing or adding recipes and pressing 'Reload Recipes' applies them live. Shader Targets take priority over patches on the same pipeline. ";
+
+	static const char* tooltipEnableShaderPatches =
+		"Enables or disables drawing patched shaders.";
+
+	static const char* tooltipReloadShaderPatchRecipes =
+		"Reloads shader patch recipes from 'ShaderInjector/ShaderPatches' and re-applies them.";
+
+	static const char* tooltipReloadShaderPatchRecipesUnavailable =
+		"No shader patch recipes were loaded when the game started, restart the game for patches to run.";
+
 	static const char* tooltipDumpBytecode =
 		"Dumps raw shader bytecode to the disk in 'ShaderInjector/Dumps'";
 } //namespace ShaderInjectorGUI

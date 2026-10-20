@@ -6,6 +6,7 @@
 #include "HookD3D12/HookD3D12.h"
 #include "HookD3D12/D3D12/HookD3D12RuntimeState.h"
 #include "ShaderDiscovery/ShaderAutomaticDiscovery.h"
+#include "ShaderPatch/ShaderPatchRuntime.h"
 
 namespace HookD3D12
 {
@@ -37,6 +38,8 @@ namespace HookD3D12
 			RebindPipelineStateInfoPointerFields(gPipelineStates.back());
 			QueueShaderTargetApplyWork();
 		}
+
+		ShaderPatchRuntime::NotifyPipelineCreated(capturedStreamPipeline.pipelineState);
 
 		//analyze after the database entry is stored so discovery can use the captured stream immediately.
 		if (gRuntimeReady.load(std::memory_order_acquire))

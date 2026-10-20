@@ -66,6 +66,8 @@
 #include "PipelineBindingCacheEntry.h"
 #include "ShaderCandidate.h"
 #include "SwapChainCommandQueueBinding.h"
+#include "ShaderPatch/ShaderPatchRuntime.h"
+#include "ShaderResource/Runtime/ShaderResourceRuntime.h"
 
 namespace HookD3D12
 {
@@ -730,6 +732,8 @@ namespace HookD3D12
 			}
 		}
 
+		//shader patches fill the remaining pipelines; Shader Target overrides already present win.
+		ShaderPatchRuntime::AppendPipelineOverrides(gPipelineStateOverrides);
 		RenderPassRuntime::CommitShaderTargetBindingUpdate();
 
 		auto publishedOverrides = std::make_unique<const PipelineStateOverrideMap>(gPipelineStateOverrides);
@@ -784,6 +788,9 @@ namespace HookD3D12
 		if (stablePublishedGeneration != publishedGeneration ||
 			gPipelineStateOverridesDirty.load(std::memory_order_acquire))
 			return false;
+
+		//a bound pipeline is patched, or re-patched after a reload, ahead of the creation backlog.
+		ShaderPatchRuntime::NotifyPipelineBound(requestedPipelineState);
 
 		const auto overrideIt = publishedOverrides->find(requestedPipelineState);
 
@@ -2443,6 +2450,10 @@ namespace HookD3D12
 			RegisterDevice(queueDevice.Get());
 			InstallPipelineHooksForDevice(queueDevice.Get());
 			InstallRenderPassResourceHooksForDevice(queueDevice.Get());
+			ShaderResourceRuntime::LoadTextures(queueDevice.Get());
+			ShaderPatchRuntime::Initialize();
+			// need to install this early if patches are running.
+			InstallDeferredRenderPassHooks(queueDevice.Get());
 		}
 
 		{
@@ -2920,6 +2931,8 @@ namespace HookD3D12
 		gRuntimeReady.store(false, std::memory_order_release);
 		gShutdown = true;
 		ShaderAutomaticDiscovery::Shutdown();
+		//join the patch worker before the pipelines and devices it uses are released.
+		ShaderPatchRuntime::Shutdown();
 		ResetOverlayStartupGate();
 
 		{

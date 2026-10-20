@@ -14,6 +14,7 @@
 #include "RenderDoc/RenderDocIntegration.h"
 #include "ShaderInjectorVersion.h"
 #include "ShaderInjectorInternalResources.h"
+#include "ShaderPatch/ShaderPatchCache.h"
 
 //dllmain starts this worker so hook setup can wait for the game without holding the loader lock.
 static DWORD WINAPI OnAttachDLL(LPVOID)
@@ -108,6 +109,8 @@ BOOL APIENTRY DllMain(HMODULE dllModule, DWORD callReason, LPVOID)
 		break;
 
 	case DLL_PROCESS_DETACH:
+		//a clean exit is the shader patch cache's only save point; a crash keeps the previous file.
+		ShaderPatchCache::Save();
 		//release the proxy and remove hooks while the process detaches.
 		FreeRealDsoundDll();
 		MH_DisableHook(MH_ALL_HOOKS);
