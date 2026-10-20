@@ -1,7 +1,8 @@
 # Shader Injector
 Shader Injector Mod for [FF7 Rebirth PC](https://store.steampowered.com/app/2909400/FINAL_FANTASY_VII_REBIRTH/). This is a DX12 *(D3D12)* based mod that intercepts the rendering API calls, and allows you to inject/replace the original shaders within the title with modified ones during runtime. This mod was built for [FF7 Rebirth](https://store.steampowered.com/app/2909400/FINAL_FANTASY_VII_REBIRTH/), however because it's primarly just a DX12 interceptor, theroetically this can be adapted to work with other D3D12 based titles.
 
-[Contact Shadows details here](https://frostbone25.github.io/p/ff7-rebirth-contact-shadows/#timings-on-1920x1080-and-3840x2160)
+[FF7 Rebirth Mod 1.0 Breakdown](https://frostbone25.github.io/p/ff7-rebirth-contact-shadows)
+[FF7 Rebirth Mod 2.1 Breakdown](https://frostbone25.github.io/p/ff7-rebirth-global-illumination/)
 
 ---
 # Download
@@ -58,8 +59,6 @@ In addition if you would like to do pull requests to improve or contribute featu
 
 ---
 # TODO
-- Vertex / Mesh Shader Replacements
-- Custom Render Passes
 - Improvements to automatic shader discovery.
 - Stability Improvements for Linux
 - General Bug / Issue Fixing
@@ -78,6 +77,7 @@ In addition if you would like to do pull requests to improve or contribute featu
 
 People who have aided in the development of this project with testing or other various tasks, big or small.
 
+- [Izueh](https://github.com/Izueh) *[(Twitter / X)](https://x.com/Luma_izueh)*
 - [Neocortex](https://www.nexusmods.com/profile/Neocoretx)
 - [Stepheroth](https://www.nexusmods.com/profile/Stepheroth)
 - [YIIS](https://www.nexusmods.com/profile/YIISx/mods)
