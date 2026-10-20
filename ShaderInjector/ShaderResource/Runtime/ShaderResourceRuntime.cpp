@@ -42,6 +42,9 @@ namespace ShaderResourceRuntime
 	{
 		constexpr UINT defaultDescriptorPageCapacity = 8192;
 		constexpr UINT defaultSamplerPageCapacity = 2048;
+		std::atomic<bool> gLoggedPartialResourceTable = false;
+		std::atomic<bool> gLoggedPartialSamplerTable = false;
+		std::atomic<bool> gLoggedIndependentSamplerTable = false;
 
 		std::mutex gTextureMutex;
 		std::unordered_map<ID3D12Device*, std::unordered_map<std::string, std::unique_ptr<TextureGPU>>> gTextures;
@@ -283,7 +286,7 @@ namespace ShaderResourceRuntime
 				if (heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
 					samplerOverride = FindSingleSamplerOverride(samplerOverrides, static_cast<size_t>(&table - slot.activeTables.data()));
 
-				const bool reusableTable = !table.hasOverrides || samplerOverride;
+				const bool reusableTable = table.sourceDescriptorCount == table.descriptorCount && (!table.hasOverrides || samplerOverride);
 
 				if (reusableTable)
 					table.sourceVersionKnown = RenderPassResourceRegistry::GetDescriptorContentVersion(table.originalCpu, table.descriptorCount, table.sourceVersion);
@@ -340,6 +343,7 @@ namespace ShaderResourceRuntime
 				copySources.clear();
 				copySourceSizes.clear();
 				UINT descriptorOffset = 0;
+				bool hasPartialSource = false;
 
 				for (ActiveTable& table : slot.activeTables)
 				{
@@ -351,14 +355,95 @@ namespace ShaderResourceRuntime
 					table.allocation.gpuStart.ptr += static_cast<UINT64>(descriptorOffset) * descriptorIncrement;
 					table.allocation.descriptorCount = table.descriptorCount;
 					descriptorOffset += table.descriptorCount;
-					copySources.push_back(table.originalCpu);
-					copySourceSizes.push_back(table.descriptorCount);
+					if (table.originalCpu.ptr)
+					{
+						copySources.push_back(table.originalCpu);
+						copySourceSizes.push_back(table.sourceDescriptorCount);
+						hasPartialSource = hasPartialSource || table.sourceDescriptorCount < table.descriptorCount;
+					}
+					else if (heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+					{
+						//the game may use only static samplers, leaving its dynamic table completely unbound.
+						//initialize every slot before applying the custom pass's explicitly configured samplers.
+						D3D12_SAMPLER_DESC description{};
+						description.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+						description.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+						description.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+						description.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+						description.MaxAnisotropy = 1;
+						description.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+						description.MaxLOD = D3D12_FLOAT32_MAX;
+
+						for (UINT descriptorIndex = 0; descriptorIndex < table.descriptorCount; ++descriptorIndex)
+						{
+							D3D12_CPU_DESCRIPTOR_HANDLE destination = table.allocation.cpuStart;
+							destination.ptr += static_cast<SIZE_T>(descriptorIndex) * descriptorIncrement;
+							device->CreateSampler(&description, destination);
+						}
+					}
 				}
 
 				{
 					PerformanceMetrics::ScopedTimer timer(PerformanceMetrics::Timing::CloneShaderResourceTables);
 
-					if (!RenderPassResourceRegistry::CopyDescriptorTables(device, allocation.cpuStart, descriptorOffset, static_cast<UINT>(copySources.size()), copySources.data(), copySourceSizes.data(), heapType))
+				//new tables are appended after inherited tables; UAVs are fully overridden and samplers receive defaults.
+					UINT copiedDescriptorCount = 0;
+
+					for (UINT sourceSize : copySourceSizes)
+						copiedDescriptorCount += sourceSize;
+
+					bool tablesCopied = true;
+
+					if (hasPartialSource)
+					{
+						//a game shader can use a short table at the heap tail even when its root declares a larger range.
+						//keep the destination offsets intact, copy only real source descriptors, and initialize the unused tail.
+						for (const ActiveTable& table : slot.activeTables)
+						{
+							if (table.heapType != heapType || !table.needsCopy || !table.originalCpu.ptr)
+								continue;
+
+							if (!RenderPassResourceRegistry::CopyDescriptorTables(device, table.allocation.cpuStart, table.sourceDescriptorCount, 1, &table.originalCpu, &table.sourceDescriptorCount, heapType))
+							{
+								tablesCopied = false;
+								break;
+							}
+
+							for (UINT descriptorIndex = table.sourceDescriptorCount; descriptorIndex < table.descriptorCount; ++descriptorIndex)
+							{
+								D3D12_CPU_DESCRIPTOR_HANDLE destination = table.allocation.cpuStart;
+								destination.ptr += static_cast<SIZE_T>(descriptorIndex) * descriptorIncrement;
+
+								if (heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+								{
+									D3D12_SAMPLER_DESC description{};
+									description.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+									description.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+									description.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+									description.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+									description.MaxAnisotropy = 1;
+									description.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+									description.MaxLOD = D3D12_FLOAT32_MAX;
+									device->CreateSampler(&description, destination);
+								}
+								else
+								{
+									D3D12_SHADER_RESOURCE_VIEW_DESC description{};
+									description.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+									description.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+									description.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+									description.Texture2D.MipLevels = 1;
+									device->CreateShaderResourceView(nullptr, &description, destination);
+								}
+							}
+						}
+					}
+					else if (!copySources.empty())
+					{
+						tablesCopied = RenderPassResourceRegistry::CopyDescriptorTables(device, allocation.cpuStart, copiedDescriptorCount, static_cast<UINT>(copySources.size()), copySources.data(), copySourceSizes.data(), heapType);
+					}
+
+					if (!tablesCopied)
 					{
 						outError = "Could not copy descriptor tables because an active source mirror is unavailable.";
 						PerformanceMetrics::Increment(PerformanceMetrics::Counter::ShaderResourceTableCopySourceMissing);
@@ -912,7 +997,7 @@ namespace ShaderResourceRuntime
 
 			if (runtimeTextureOverride && runtimeTextureOverride->resourceId == input.resourceId)
 				texture.shaderResourceView = runtimeTextureOverride->shaderResourceView;
-			else if (!RenderPassTexturePool::GetInputTexture(input.resourceId, input.temporalView, texture) &&
+			else if (!RenderPassTexturePool::GetInputTexture(input.resourceId, input.temporalView, texture, input.allowCrossAnchor) &&
 					 input.temporalView == ShaderResource::TemporalView::Previous)
 				RenderPassTexturePool::GetHistoryBootstrapTexture(device, input.resourceId, texture);
 
@@ -975,40 +1060,34 @@ namespace ShaderResourceRuntime
 			if (byteOffset >= heapBytes)
 				continue;
 
-			UINT descriptorCount = layoutIt->descriptorCount;
+			//the root layout defines the destination span; the heap bounds define how much source can be copied.
+			//unbounded ranges remain capped by maximumTrackedDescriptors through the resolved layout.
+			const UINT descriptorCount = layoutIt->descriptorCount;
+			const UINT64 availableDescriptorCount = (heapBytes - byteOffset) / sourceHeap->descriptorIncrementSize;
+			const UINT sourceDescriptorCount = static_cast<UINT>((std::min)(availableDescriptorCount, static_cast<UINT64>(descriptorCount)));
 
-			if (layoutIt->containsUnboundedRange &&
-				(layoutIt->heapType == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
-				 layoutIt->heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER))
-			{
-				const UINT64 availableDescriptorCount64 = (heapBytes - byteOffset) / sourceHeap->descriptorIncrementSize;
-				const UINT availableDescriptorCount = static_cast<UINT>((std::min)(availableDescriptorCount64, static_cast<UINT64>(UINT_MAX)));
-
-				//GetDescriptorTableLayouts resolves an unbounded range using the pass's
-				//maximumTrackedDescriptors value. Keep that configured value as the hard
-				//copy limit. Expanding every table to thousands of contiguous game
-				//descriptors multiplies the work by every pass in a graph and exhausts
-				//shader-visible descriptor heaps on long or warmed-cache sessions.
-				descriptorCount = (std::min)(descriptorCount, availableDescriptorCount);
-			}
-			else
-			{
-				const UINT64 requiredBytes = static_cast<UINT64>(descriptorCount) * sourceHeap->descriptorIncrementSize;
-
-				if (requiredBytes > heapBytes - byteOffset)
-					continue;
-			}
-
-			if (!descriptorCount)
+			if (!descriptorCount || !sourceDescriptorCount)
 				continue;
 
 			ActiveTable table{};
 			table.rootParameterIndex = binding.rootParameterIndex;
 			table.heapType = layoutIt->heapType;
 			table.descriptorCount = descriptorCount;
+			table.sourceDescriptorCount = sourceDescriptorCount;
 			table.canReuseBinding = layoutIt->canReuseBinding;
 			table.originalGpu = {binding.value};
 			table.originalCpu = {sourceHeap->cpuStart.ptr + byteOffset};
+
+			if (sourceDescriptorCount < descriptorCount)
+			{
+				auto* loggedPartialTable = &gLoggedPartialResourceTable;
+
+				if (table.heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+					loggedPartialTable = &gLoggedPartialSamplerTable;
+
+				if (!loggedPartialTable->exchange(true, std::memory_order_relaxed))
+					ShaderInjectorIO::WriteToLogFile("ShaderResourceRuntime->BindResources: extending short game descriptor table pass=" + renderPass.name + " rootParameter=" + std::to_string(table.rootParameterIndex) + " sourceDescriptors=" + std::to_string(sourceDescriptorCount) + " destinationDescriptors=" + std::to_string(descriptorCount));
+			}
 
 			if (table.heapType == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
 			{
@@ -1044,18 +1123,6 @@ namespace ShaderResourceRuntime
 			}
 
 			slot.activeTables.push_back(table);
-		}
-
-		if (requiresResourceHeap && !totalDescriptors)
-		{
-			outError = "No CBV/SRV/UAV descriptor table is active.";
-			return false;
-		}
-
-		if (requiresSamplerHeap && !totalSamplerDescriptors)
-		{
-			outError = "No dynamic sampler descriptor table is active. Static samplers cannot be overridden.";
-			return false;
 		}
 
 		if (!slot.descriptorIncrementSize)
@@ -1150,6 +1217,37 @@ namespace ShaderResourceRuntime
 					location = &candidate;
 					activeTable = &*tableIt;
 					break;
+				}
+			}
+
+			if (!location || !activeTable)
+			{
+				//custom passes may need UAVs or dynamic samplers that the game draw never binds.
+				//UAVs require complete explicit coverage; sampler tables can initialize unused slots to valid defaults.
+				if ((rangeType == D3D12_DESCRIPTOR_RANGE_TYPE_UAV || samplerDescriptor) && !locationIt->second.empty())
+				{
+					const auto& candidate = locationIt->second.front();
+					const auto layoutIterator = std::find_if(slot.layouts.begin(), slot.layouts.end(), [&](const auto& layout) { return layout.rootParameterIndex == candidate.rootParameterIndex; });
+
+					if (layoutIterator != slot.layouts.end())
+					{
+						ActiveTable outputTable{};
+						outputTable.rootParameterIndex = candidate.rootParameterIndex;
+						outputTable.heapType = requiredHeapType;
+						outputTable.descriptorCount = layoutIterator->descriptorCount;
+						slot.activeTables.push_back(outputTable);
+						if (samplerDescriptor)
+						{
+							totalSamplerDescriptors += outputTable.descriptorCount;
+
+							if (!gLoggedIndependentSamplerTable.exchange(true, std::memory_order_relaxed))
+								ShaderInjectorIO::WriteToLogFile("ShaderResourceRuntime->BindResources: supplying independent sampler table pass=" + renderPass.name + " descriptors=" + std::to_string(outputTable.descriptorCount));
+						}
+						else
+							totalDescriptors += outputTable.descriptorCount;
+						location = &candidate;
+						activeTable = &slot.activeTables.back();
+					}
 				}
 			}
 
@@ -1343,6 +1441,34 @@ namespace ShaderResourceRuntime
 				samplerOverrides.push_back({tableIndex, tableOffset, description});
 			else
 				existingSampler->description = description;
+		}
+
+		for (size_t tableIndex = 0; tableIndex < slot.activeTables.size(); ++tableIndex)
+		{
+			const auto& table = slot.activeTables[tableIndex];
+
+			if (table.originalCpu.ptr || table.heapType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+				continue;
+
+			const size_t overrideCount = std::count_if(descriptorOverrides.begin(), descriptorOverrides.end(), [&](const auto& descriptorOverride) { return descriptorOverride.tableIndex == tableIndex; });
+
+			if (overrideCount != table.descriptorCount)
+			{
+				outError = "A new UAV table must have every descriptor explicitly supplied by the custom pass.";
+				return false;
+			}
+		}
+
+		if (requiresResourceHeap && !totalDescriptors)
+		{
+			outError = "No CBV/SRV/UAV descriptor table is active.";
+			return false;
+		}
+
+		if (requiresSamplerHeap && !totalSamplerDescriptors)
+		{
+			outError = "No dynamic sampler descriptor table is active. Static samplers cannot be overridden.";
+			return false;
 		}
 
 		if (requiresResourceHeap && !PrepareChainTables(slot, device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, slot.resourceTablePool, totalDescriptors, samplerOverrides, outError))

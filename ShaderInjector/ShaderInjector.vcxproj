@@ -272,6 +272,7 @@
     <ClInclude Include="RenderPass\RenderPass.h" />
     <ClInclude Include="RenderPass\RenderPassExecutor.h" />
     <ClInclude Include="RenderPass\ExecutorEventNameLookup.h" />
+    <ClInclude Include="RenderPass\ExecutorGraphicsComputePipeline.h" />
     <ClInclude Include="RenderPass\RenderPassGraph.h" />
     <ClInclude Include="RenderPass\RenderPassMipChain.h" />
     <ClInclude Include="RenderPass\RecordedTextureState.h" />

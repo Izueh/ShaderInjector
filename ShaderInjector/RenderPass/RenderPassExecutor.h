@@ -11,6 +11,14 @@
 
 namespace RenderPassExecutor
 {
+	bool PrepareGraphicsComputeState(
+		const RenderPass::RenderPassDisk& renderPass,
+		ID3D12GraphicsCommandList* commandList,
+		const RenderPassMipChain::GraphicsStateSnapshot& graphicsState,
+		RenderPassMipChain::GraphicsStateSnapshot& outComputeState,
+		ID3D12PipelineState*& outPipelineState,
+		std::string& outError);
+	void RestoreComputeState(ID3D12GraphicsCommandList* commandList, const RenderPassMipChain::GraphicsStateSnapshot& computeState);
 	bool ExecuteFullscreenTriangle(
 		const RenderPass::RenderPassDisk& renderPass,
 		ID3D12GraphicsCommandList* commandList,

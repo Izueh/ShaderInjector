@@ -11,6 +11,8 @@
 #include "RenderPass/RenderTargetState.h"
 #include "RenderPass/ExecutorThreadPipelineLookup.h"
 #include "RenderPass/ExecutorEventNameLookup.h"
+#include "RenderPass/ExecutorGraphicsComputePipeline.h"
+#include "RenderPass/RenderPassResourceRegistry.h"
 #include "RenderPass/RenderPassReplacement.h"
 #include "RenderPass/RenderPassTexturePool.h"
 #include "ShaderResource/Runtime/ShaderResourceRuntime.h"
@@ -25,6 +27,7 @@ namespace RenderPassExecutor
 	std::mutex gPipelineCacheMutex;
 	std::unordered_map<std::string, ID3D12PipelineState*> gPipelineCache;
 	std::unordered_map<std::string, std::string> gPipelineCreationErrors;
+	std::unordered_map<std::string, GraphicsComputePipeline> gGraphicsComputePipelines;
 	std::atomic<bool> gLoggedExecutionDuringActiveCapture = false;
 	std::atomic<uint64_t> gLoggedCaptureRequestSequence = 0;
 
@@ -449,6 +452,172 @@ namespace RenderPassExecutor
 		return true;
 	}
 
+	bool PrepareGraphicsComputeState(
+		const RenderPass::RenderPassDisk& renderPass,
+		ID3D12GraphicsCommandList* commandList,
+		const RenderPassMipChain::GraphicsStateSnapshot& graphicsState,
+		RenderPassMipChain::GraphicsStateSnapshot& outComputeState,
+		ID3D12PipelineState*& outPipelineState,
+		std::string& outError)
+	{
+		outPipelineState = nullptr;
+		const std::string cacheKey = renderPass.id + ":compute:" + StringHelper::PointerToString(graphicsState.rootSignature);
+		std::lock_guard<std::mutex> cacheLock(gPipelineCacheMutex);
+		auto pipelineIterator = gGraphicsComputePipelines.find(cacheKey);
+
+		if (pipelineIterator == gGraphicsComputePipelines.end())
+		{
+			std::vector<uint8_t> rootBytes;
+			uint64_t rootHash = 0;
+
+			if (!HookD3D12::GetRootSignatureBlob(graphicsState.rootSignature, rootBytes, rootHash))
+			{
+				outError = "Graphics-anchored compute requires a captured root signature.";
+				return false;
+			}
+
+			Microsoft::WRL::ComPtr<ID3D12VersionedRootSignatureDeserializer> deserializer;
+			const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* sourceDescription = nullptr;
+
+			if (FAILED(D3D12CreateVersionedRootSignatureDeserializer(rootBytes.data(), rootBytes.size(), IID_PPV_ARGS(&deserializer))) || FAILED(deserializer->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_0, &sourceDescription)))
+			{
+				outError = "Could not inspect the graphics root for a custom compute pass.";
+				return false;
+			}
+
+			GraphicsComputePipeline computePipeline;
+			const auto& sourceRoot = sourceDescription->Desc_1_0;
+			computePipeline.rootParameterMap.resize(sourceRoot.NumParameters, UINT_MAX);
+			std::vector<D3D12_ROOT_PARAMETER> parameters;
+			std::vector<D3D12_STATIC_SAMPLER_DESC> staticSamplers;
+			std::vector<D3D12_DESCRIPTOR_RANGE> outputRanges;
+
+			//pixel and vertex stages can reuse a register, so discard vertex-only arguments before promoting visibility.
+			for (UINT parameterIndex = 0; parameterIndex < sourceRoot.NumParameters; ++parameterIndex)
+			{
+				auto parameter = sourceRoot.pParameters[parameterIndex];
+
+				if (parameter.ShaderVisibility != D3D12_SHADER_VISIBILITY_PIXEL && parameter.ShaderVisibility != D3D12_SHADER_VISIBILITY_ALL)
+					continue;
+
+				parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+				computePipeline.rootParameterMap[parameterIndex] = static_cast<UINT>(parameters.size());
+				parameters.push_back(parameter);
+			}
+
+			for (UINT samplerIndex = 0; samplerIndex < sourceRoot.NumStaticSamplers; ++samplerIndex)
+			{
+				auto sampler = sourceRoot.pStaticSamplers[samplerIndex];
+
+				if (sampler.ShaderVisibility != D3D12_SHADER_VISIBILITY_PIXEL && sampler.ShaderVisibility != D3D12_SHADER_VISIBILITY_ALL)
+					continue;
+
+				sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+				staticSamplers.push_back(sampler);
+			}
+
+			//a compact appended table contains only declared outputs; every descriptor is supplied by the pass.
+			for (const auto& output : renderPass.outputs)
+			{
+				if (output.origin == ShaderResource::ResourceOrigin::Runtime && output.access == RenderPass::ResourceAccess::UnorderedAccess)
+					outputRanges.push_back({D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, output.shaderRegister, output.registerSpace, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND});
+			}
+
+			if (!outputRanges.empty())
+			{
+				D3D12_ROOT_PARAMETER outputParameter{};
+				outputParameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+				outputParameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+				outputParameter.DescriptorTable = {static_cast<UINT>(outputRanges.size()), outputRanges.data()};
+				parameters.push_back(outputParameter);
+			}
+
+			D3D12_ROOT_SIGNATURE_DESC rootDescription{};
+			rootDescription.NumParameters = static_cast<UINT>(parameters.size());
+			rootDescription.pParameters = parameters.data();
+			rootDescription.NumStaticSamplers = static_cast<UINT>(staticSamplers.size());
+			rootDescription.pStaticSamplers = staticSamplers.data();
+			Microsoft::WRL::ComPtr<ID3DBlob> serializedRoot;
+			Microsoft::WRL::ComPtr<ID3DBlob> serializationErrors;
+			HRESULT result = D3D12SerializeRootSignature(&rootDescription, D3D_ROOT_SIGNATURE_VERSION_1_0, &serializedRoot, &serializationErrors);
+
+			if (FAILED(result))
+			{
+				outError = "Custom compute root serialization failed with " + StringHelper::FormatHRESULT(result);
+				return false;
+			}
+
+			Microsoft::WRL::ComPtr<ID3D12Device> device;
+			commandList->GetDevice(IID_PPV_ARGS(&device));
+			HookD3D12::ScopedRenderPassInjection injectionScope;
+			result = device->CreateRootSignature(0, serializedRoot->GetBufferPointer(), serializedRoot->GetBufferSize(), IID_PPV_ARGS(&computePipeline.rootSignature));
+
+			if (FAILED(result))
+			{
+				outError = "Custom compute root creation failed with " + StringHelper::FormatHRESULT(result);
+				return false;
+			}
+
+			D3D12_COMPUTE_PIPELINE_STATE_DESC pipelineDescription{};
+			pipelineDescription.pRootSignature = computePipeline.rootSignature.Get();
+			pipelineDescription.CS = {renderPass.fragmentShaderBlob.data(), renderPass.fragmentShaderBlob.size()};
+			result = device->CreateComputePipelineState(&pipelineDescription, IID_PPV_ARGS(&computePipeline.pipelineState));
+
+			if (FAILED(result))
+			{
+				outError = "Graphics-anchored compute pipeline creation failed with " + StringHelper::FormatHRESULT(result);
+				return false;
+			}
+
+			RenderPassResourceRegistry::RegisterRootSignature(computePipeline.rootSignature.Get(), serializedRoot->GetBufferPointer(), serializedRoot->GetBufferSize());
+			pipelineIterator = gGraphicsComputePipelines.emplace(cacheKey, std::move(computePipeline)).first;
+		}
+
+		const auto& computePipeline = pipelineIterator->second;
+		outComputeState = graphicsState;
+		outComputeState.rootSignature = computePipeline.rootSignature.Get();
+		outComputeState.rootBindings.clear();
+
+		for (auto binding : graphicsState.rootBindings)
+		{
+			if (binding.rootParameterIndex >= computePipeline.rootParameterMap.size() || computePipeline.rootParameterMap[binding.rootParameterIndex] == UINT_MAX)
+				continue;
+
+			binding.rootParameterIndex = computePipeline.rootParameterMap[binding.rootParameterIndex];
+			outComputeState.rootBindings.push_back(std::move(binding));
+		}
+
+		outPipelineState = computePipeline.pipelineState.Get();
+		return true;
+	}
+
+	void RestoreComputeState(ID3D12GraphicsCommandList* commandList, const RenderPassMipChain::GraphicsStateSnapshot& computeState)
+	{
+		commandList->SetComputeRootSignature(computeState.rootSignature);
+
+		for (const auto& binding : computeState.rootBindings)
+		{
+			switch (binding.type)
+			{
+			case RenderPassMipChain::RootArgumentType::DescriptorTable:
+				commandList->SetComputeRootDescriptorTable(binding.rootParameterIndex, {binding.value});
+				break;
+			case RenderPassMipChain::RootArgumentType::ConstantBufferView:
+				commandList->SetComputeRootConstantBufferView(binding.rootParameterIndex, binding.value);
+				break;
+			case RenderPassMipChain::RootArgumentType::ShaderResourceView:
+				commandList->SetComputeRootShaderResourceView(binding.rootParameterIndex, binding.value);
+				break;
+			case RenderPassMipChain::RootArgumentType::UnorderedAccessView:
+				commandList->SetComputeRootUnorderedAccessView(binding.rootParameterIndex, binding.value);
+				break;
+			case RenderPassMipChain::RootArgumentType::Constants:
+				commandList->SetComputeRoot32BitConstants(binding.rootParameterIndex, static_cast<UINT>(binding.constants.size()), binding.constants.data(), 0);
+				break;
+			}
+		}
+	}
+
 	bool ExecuteCompute(
 		const RenderPass::RenderPassDisk& renderPass,
 		ID3D12GraphicsCommandList* commandList,
@@ -642,6 +811,7 @@ namespace RenderPassExecutor
 		}
 
 		gPipelineCache.clear();
+		gGraphicsComputePipelines.clear();
 		gPipelineCreationErrors.clear();
 		gThreadPipelineLookups = {};
 		gNextThreadPipelineLookup = 0;
