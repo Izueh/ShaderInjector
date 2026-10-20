@@ -1,0 +1,15 @@
+#pragma once
+
+#include <string>
+
+#include "ModifiedShader/ModifiedShader.h"
+#include "RenderPass/RenderPass.h"
+
+namespace RenderPassShaders
+{
+	bool CreateShaderTemplate(
+		RenderPass::RenderPassDisk& renderPass,
+		const ModifiedShader::ModifiedShaderPackageDisk& modifiedShader,
+		std::string& outError);
+	bool CompileShaders(RenderPass::RenderPassDisk& renderPass, std::string& outError);
+} //namespace RenderPassShaders

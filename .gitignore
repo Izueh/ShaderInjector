@@ -433,3 +433,9 @@ PDFs/
 
 # Cross-version discovery test suite (CMake out-of-tree build)
 Tests/CrossVersionDiscovery/build/
+/ShaderInjector/Tests
+/ShaderInjector/x64/Tests
+/ShaderInjector/x64/Validation/
+ShaderInjector/DirectionalLightShadows_BounceExperiment.hlsl
+/ShaderInjector/.codex
+/ShaderInjector/Validation

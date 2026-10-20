@@ -1,0 +1,23 @@
+#include "../HookD3D12.h"
+
+#include "Globals.h"
+#include "RenderPass/RenderPassRuntime.h"
+
+namespace HookD3D12
+{
+	void STDMETHODCALLTYPE Hook_SetComputeRoot32BitConstant(ID3D12GraphicsCommandList* commandList, UINT rootParameterIndex, UINT value, UINT destinationOffset)
+	{
+		Handle_SetComputeRoot32BitConstant(commandList, rootParameterIndex, value, destinationOffset);
+	}
+
+	void STDMETHODCALLTYPE Handle_SetComputeRoot32BitConstant(ID3D12GraphicsCommandList* commandList, UINT rootParameterIndex, UINT value, UINT destinationOffset)
+	{
+		if (IsInjectorEnabledForCommandList(commandList) && RenderPassRuntime::IsRootBindingTrackingRequired() &&
+			RenderPassRuntime::IsPipelineExecutionTrackingRequired(true) && !IsInsideRenderPassInjection())
+		{
+			RenderPassRuntime::TrackRootConstants(commandList, true, rootParameterIndex, 1, &value, destinationOffset);
+		}
+
+		Original_SetComputeRoot32BitConstant(commandList, rootParameterIndex, value, destinationOffset);
+	}
+} //namespace HookD3D12

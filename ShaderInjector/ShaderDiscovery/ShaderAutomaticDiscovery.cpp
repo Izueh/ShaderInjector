@@ -1,0 +1,1406 @@
+#include "ShaderDiscovery/ShaderAutomaticDiscovery.h"
+#include "ShaderDiscovery/AnalysisJob.h"
+#include "ShaderDiscovery/AnalysisResult.h"
+#include "ShaderDiscovery/QueuedShader.h"
+#include "ShaderTarget/ShaderIdentityKey.h"
+#include "ShaderTarget/ShaderIdentityKeyHasher.h"
+#include "Enum/ShaderAutomaticDiscoveryPipelineSource.h"
+
+#include <deque>
+#include <vector>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstdlib>
+#include <iterator>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <wrl/client.h>
+
+#include "ModifiedShader/DatabaseModifiedShaders.h"
+#include "ShaderTarget/DatabaseShaderTargets.h"
+#include "Globals.h"
+#include "Hash/Hash.h"
+#include "HookD3D12.h"
+#include "ShaderAnalysis/ShaderAnalysis.h"
+#include "ShaderDiscovery/ShaderDiscovery.h"
+#include "GUI/ShaderInjectorGUI.h"
+#include "StringHelper.h"
+
+namespace ShaderAutomaticDiscovery
+{
+	using ShaderTarget::ShaderIdentityKey;
+	using ShaderTarget::ShaderIdentityKeyHasher;
+
+	namespace
+	{
+		constexpr size_t defaultMaximumPendingAnalyses = 64;
+		constexpr size_t defaultQueuedShaderLimit = 8192;
+		constexpr size_t maximumPendingAnalysesLimit = 8192;
+		constexpr size_t maximumQueuedShadersLimit = 65536;
+
+		size_t AutomaticAnalysisWorkerThreadCount()
+		{
+			const unsigned int detectedThreads = std::thread::hardware_concurrency();
+			size_t suggestedThreads = 4;
+			if (detectedThreads > 0)
+				suggestedThreads = detectedThreads / 2;
+			return (std::clamp<size_t>)(suggestedThreads, 2, 16);
+		}
+
+		size_t ConfiguredAnalysisWorkerThreadCount()
+		{
+			if (Globals::gShaderDiscoveryWorkerThreads > 0)
+				return (std::clamp<size_t>)(static_cast<size_t>(Globals::gShaderDiscoveryWorkerThreads), 1, 64);
+
+			return AutomaticAnalysisWorkerThreadCount();
+		}
+
+		size_t ConfiguredPendingAnalysisLimit()
+		{
+			if (Globals::gShaderDiscoveryPendingAnalysisLimit <= 0)
+				return defaultMaximumPendingAnalyses;
+
+			return (std::clamp<size_t>)(static_cast<size_t>(Globals::gShaderDiscoveryPendingAnalysisLimit),
+										1,
+										maximumPendingAnalysesLimit);
+		}
+
+		size_t ConfiguredQueuedShaderLimit()
+		{
+			if (Globals::gShaderDiscoveryQueuedShaderLimit <= 0)
+				return defaultQueuedShaderLimit;
+
+			return (std::clamp<size_t>)(static_cast<size_t>(Globals::gShaderDiscoveryQueuedShaderLimit),
+										1024,
+										maximumQueuedShadersLimit);
+		}
+
+		std::mutex gQueueMutex;
+		std::deque<QueuedShader> gQueuedShaders;
+		std::deque<AnalysisJob> gAnalysisJobs;
+		std::deque<AnalysisResult> gAnalysisResults;
+		std::unordered_set<ShaderIdentityKey, ShaderIdentityKeyHasher> gSubmittedShaders;
+		std::unordered_map<ShaderIdentityKey, std::string, ShaderIdentityKeyHasher> gDirectMatchShaders;
+		std::unordered_set<std::string> gModifiedShadersWithGeneratedTargets;
+		std::shared_ptr<const std::vector<ModifiedShader::ModifiedShaderPackageDisk>> gModifiedShaderAnalysisSnapshot;
+		bool gCompatibleShaderTypes[static_cast<size_t>(ShaderTarget::Unknown) + 1]{};
+		bool gSeenShaderTypes[static_cast<size_t>(ShaderTarget::Unknown) + 1]{};
+		std::vector<std::pair<size_t, size_t>> gPlausibleByteLengthRanges[static_cast<size_t>(ShaderTarget::Unknown) + 1];
+		std::chrono::steady_clock::time_point gSessionStartTime{};
+		bool gSessionStartTimeInitialized = false;
+		bool gNeverSeenShaderTypeDiagnosticLogged = false;
+		constexpr std::chrono::seconds neverSeenShaderTypeDiagnosticDelay{60};
+		constexpr std::chrono::seconds progressLogInterval{5};
+		constexpr uint64_t progressLogCompletedStep = 25;
+		constexpr uint64_t progressLogQueuedStep = 100;
+		std::condition_variable gAnalysisCondition;
+		std::vector<std::thread> gAnalysisWorkers;
+		bool gAnalysisWorkerRunning = false;
+		size_t gRunningAnalysisWorkerCount = 0;
+		bool gAnalysisStopRequested = false;
+		bool gAcceptingWork = true;
+		size_t gActiveAnalysisJobs = 0;
+		uint64_t gQueuedShaderTotal = 0;
+		uint64_t gAnalysisSubmittedTotal = 0;
+		uint64_t gAnalysisCompletedTotal = 0;
+		uint64_t gAnalysisMatchedTotal = 0;
+		uint64_t gAnalysisFailedTotal = 0;
+		uint64_t gDirectMatchProcessedTotal = 0;
+		uint64_t gShaderTargetsCreatedTotal = 0;
+		uint64_t gByteLengthRejectedTotal = 0;
+		uint64_t gQueueDroppedTotal = 0;
+		uint64_t gQueueEvictedTotal = 0;
+		uint64_t gAnalysisPreemptedTotal = 0;
+		uint64_t gLastLoggedProcessedTotal = 0;
+		uint64_t gLastLoggedQueuedTotal = 0;
+		std::chrono::steady_clock::time_point gLastProgressLogTime{};
+		bool gProgressWasActive = false;
+		bool gDiscoverySatisfiedLogged = false;
+		//Newer game patches tend to compile shaders slightly smaller than the version a mod
+		//package was originally built against, so the lower bound gets more slack than the
+		//upper bound.
+		constexpr size_t byteLengthLowerTolerancePercent = 35;
+		constexpr size_t byteLengthUpperTolerancePercent = 15;
+
+		const char* ShaderDiscoveryModeName()
+		{
+			switch (Globals::gShaderDiscoveryMode)
+			{
+			case Globals::ShaderDiscoveryMode::ShaderAnalysis:
+				return "ShaderAnalysis";
+			case Globals::ShaderDiscoveryMode::HashLookup:
+			default:
+				return "HashLookup";
+			}
+		}
+
+		bool ParseByteLength(const std::string& byteLengthText, size_t& outByteLength)
+		{
+			if (byteLengthText.empty())
+				return false;
+
+			char* parseEnd = nullptr;
+			const unsigned long long parsedLength = std::strtoull(byteLengthText.c_str(), &parseEnd, 10);
+
+			if (!parseEnd || *parseEnd != '\0' || parsedLength == 0)
+				return false;
+
+			outByteLength = static_cast<size_t>(parsedLength);
+			return true;
+		}
+
+		void AddPlausibleByteLengthRange(ShaderTarget::ShaderType shaderType, size_t byteLength)
+		{
+			const size_t shaderTypeIndex = static_cast<size_t>(shaderType);
+
+			if (shaderTypeIndex >= static_cast<size_t>(ShaderTarget::Unknown) || byteLength == 0)
+				return;
+
+			const size_t lowerTolerance = (std::max<size_t>)(1, (byteLength * byteLengthLowerTolerancePercent) / 100);
+			const size_t upperTolerance = (std::max<size_t>)(1, (byteLength * byteLengthUpperTolerancePercent) / 100);
+
+			size_t minimumLength = 1;
+
+			if (byteLength > lowerTolerance)
+				minimumLength = byteLength - lowerTolerance;
+
+			const size_t maximumLength = byteLength + upperTolerance;
+			gPlausibleByteLengthRanges[shaderTypeIndex].push_back({minimumLength, maximumLength});
+		}
+
+		//Combines overlapping ranges into one sorted list per shader type, so lookups can use
+		//binary search instead of checking every range one by one.
+		void MergePlausibleByteLengthRanges()
+		{
+			for (auto& ranges : gPlausibleByteLengthRanges)
+			{
+				if (ranges.size() < 2)
+					continue;
+
+				std::sort(ranges.begin(), ranges.end());
+
+				std::vector<std::pair<size_t, size_t>> merged;
+				merged.reserve(ranges.size());
+
+				for (const auto& range : ranges)
+				{
+					if (!merged.empty() && range.first <= merged.back().second)
+						merged.back().second = (std::max)(merged.back().second, range.second);
+					else
+						merged.push_back(range);
+				}
+
+				ranges = std::move(merged);
+			}
+		}
+
+		bool HasPlausibleByteLength(ShaderTarget::ShaderType shaderType, size_t byteLength)
+		{
+			const size_t shaderTypeIndex = static_cast<size_t>(shaderType);
+
+			if (shaderTypeIndex >= static_cast<size_t>(ShaderTarget::Unknown))
+				return false;
+
+			const std::vector<std::pair<size_t, size_t>>& ranges = gPlausibleByteLengthRanges[shaderTypeIndex];
+
+			if (ranges.empty())
+				return true;
+
+			//Find the last range that starts at or before byteLength, then check if it fits inside it.
+			const auto it = std::upper_bound(ranges.begin(), ranges.end(), byteLength,
+											 [](size_t value, const std::pair<size_t, size_t>& range)
+											 { return value < range.first; });
+
+			if (it == ranges.begin())
+				return false;
+
+			const auto& candidate = *std::prev(it);
+			return byteLength >= candidate.first && byteLength <= candidate.second;
+		}
+
+		double ByteLengthSimilarity(size_t candidateLength, size_t referenceLength)
+		{
+			if (candidateLength == 0 || referenceLength == 0)
+				return 0.0;
+
+			const double largerLength = static_cast<double>((std::max)(candidateLength, referenceLength));
+			const double difference = std::fabs(static_cast<double>(candidateLength) - static_cast<double>(referenceLength));
+			return (std::max)(0.0, 1.0 - (difference / largerLength));
+		}
+
+		double ShaderTypeQueuePriorityBonus(ShaderTarget::ShaderType shaderType)
+		{
+			//Shader discovery can see thousands of compute shaders while gameplay is loading.
+			//Graphics shaders are usually the visible targets users are hunting for, so they
+			//should jump ahead even if they arrive after a compute-heavy batch.
+			switch (shaderType)
+			{
+			case ShaderTarget::PixelShader:
+				return 100000.0;
+			case ShaderTarget::VertexShader:
+			case ShaderTarget::HullShader:
+			case ShaderTarget::DomainShader:
+			case ShaderTarget::GeometryShader:
+			case ShaderTarget::AmplificationShader:
+			case ShaderTarget::MeshShader:
+				return 90000.0;
+			case ShaderTarget::ComputeShader:
+				return 0.0;
+			default:
+				return 1000.0;
+			}
+		}
+
+		double CalculateQueuePriorityLocked(
+			ShaderTarget::ShaderType shaderType,
+			size_t byteLength,
+			bool force,
+			bool directMatch)
+		{
+			if (force)
+				return 1000000.0;
+			if (directMatch)
+				return 900000.0;
+
+			double bestLengthSimilarity = 0.0;
+
+			if (gModifiedShaderAnalysisSnapshot)
+			{
+				for (const ModifiedShader::ModifiedShaderPackageDisk& modifiedShader : *gModifiedShaderAnalysisSnapshot)
+				{
+					if (!modifiedShader.enabled || modifiedShader.shaderType != shaderType)
+						continue;
+
+					for (const ModifiedShader::ModifiedShaderTargetDisk& target : modifiedShader.targets)
+					{
+						size_t targetLength = 0;
+						if (!ParseByteLength(target.originalShaderBytecodeLength, targetLength))
+							continue;
+
+						bestLengthSimilarity = (std::max)(
+							bestLengthSimilarity,
+							ByteLengthSimilarity(byteLength, targetLength));
+					}
+				}
+			}
+
+			//Most cross-version matches are still close in byte size. This is deliberately
+			//only a queue ordering hint; the full bytecode analysis remains the authority.
+			return ShaderTypeQueuePriorityBonus(shaderType) + bestLengthSimilarity;
+		}
+
+		std::deque<QueuedShader>::iterator FindLowestPriorityQueuedShaderLocked()
+		{
+			if (gQueuedShaders.empty())
+				return gQueuedShaders.end();
+
+			auto lowestPriorityIterator = gQueuedShaders.begin();
+
+			for (auto queuedIterator = std::next(gQueuedShaders.begin()); queuedIterator != gQueuedShaders.end(); ++queuedIterator)
+			{
+				if (queuedIterator->priority < lowestPriorityIterator->priority)
+					lowestPriorityIterator = queuedIterator;
+			}
+
+			return lowestPriorityIterator;
+		}
+
+		bool PopHighestPriorityQueuedShaderLocked(QueuedShader& outQueuedShader)
+		{
+			if (gQueuedShaders.empty())
+				return false;
+
+			auto highestPriorityIterator = gQueuedShaders.begin();
+
+			for (auto queuedIterator = std::next(gQueuedShaders.begin()); queuedIterator != gQueuedShaders.end(); ++queuedIterator)
+			{
+				if (queuedIterator->priority > highestPriorityIterator->priority)
+					highestPriorityIterator = queuedIterator;
+			}
+
+			outQueuedShader = std::move(*highestPriorityIterator);
+			gQueuedShaders.erase(highestPriorityIterator);
+
+			return true;
+		}
+
+		std::deque<AnalysisJob>::iterator FindLowestPriorityAnalysisJobLocked()
+		{
+			if (gAnalysisJobs.empty())
+				return gAnalysisJobs.end();
+
+			auto lowestPriorityIterator = gAnalysisJobs.begin();
+
+			for (auto jobIterator = std::next(gAnalysisJobs.begin()); jobIterator != gAnalysisJobs.end(); ++jobIterator)
+			{
+				if (jobIterator->queuedShader.priority < lowestPriorityIterator->queuedShader.priority)
+					lowestPriorityIterator = jobIterator;
+			}
+
+			return lowestPriorityIterator;
+		}
+
+		bool PopHighestPriorityAnalysisJobLocked(AnalysisJob& outJob)
+		{
+			if (gAnalysisJobs.empty())
+				return false;
+
+			auto highestPriorityIterator = gAnalysisJobs.begin();
+
+			for (auto jobIterator = std::next(gAnalysisJobs.begin()); jobIterator != gAnalysisJobs.end(); ++jobIterator)
+			{
+				if (jobIterator->queuedShader.priority > highestPriorityIterator->queuedShader.priority)
+					highestPriorityIterator = jobIterator;
+			}
+
+			outJob = std::move(*highestPriorityIterator);
+			gAnalysisJobs.erase(highestPriorityIterator);
+
+			return true;
+		}
+
+		bool TargetContainsHash(const ShaderTarget::ShaderTargetDisk& target, uint64_t shaderHash)
+		{
+			if (Hash::ParseHashText(target.originalShaderBytecodeHash) == shaderHash)
+				return true;
+
+			for (const std::string& aliasHash : target.shaderBytecodeHashAliases)
+			{
+				if (Hash::ParseHashText(aliasHash) == shaderHash)
+					return true;
+			}
+
+			return false;
+		}
+
+		size_t CountLoadedShaderTargetsForModifiedShader(const std::string& modifiedShaderId)
+		{
+			size_t count = 0;
+
+			for (const ShaderTarget::ShaderTargetDisk& target : HookD3D12::gLoadedShaderTargets)
+			{
+				if (target.modifiedShaderId == modifiedShaderId)
+					++count;
+			}
+
+			return count;
+		}
+
+		bool ModifiedShaderHasTargetLocked(const std::string& modifiedShaderId)
+		{
+			if (modifiedShaderId.empty())
+				return false;
+
+			if (CountLoadedShaderTargetsForModifiedShader(modifiedShaderId) > 0)
+				return true;
+
+			return gModifiedShadersWithGeneratedTargets.find(modifiedShaderId) != gModifiedShadersWithGeneratedTargets.end();
+		}
+
+		bool ModifiedShaderAlreadyHasGeneratedTarget(const std::string& modifiedShaderId)
+		{
+			std::lock_guard<std::mutex> lock(gQueueMutex);
+			return ModifiedShaderHasTargetLocked(modifiedShaderId);
+		}
+
+		bool AllEnabledModifiedShadersHaveTargetsLocked()
+		{
+			if (!gModifiedShaderAnalysisSnapshot)
+				return false;
+
+			size_t enabledModifiedShaderCount = 0;
+
+			for (const ModifiedShader::ModifiedShaderPackageDisk& modifiedShader : *gModifiedShaderAnalysisSnapshot)
+			{
+				if (!modifiedShader.enabled || modifiedShader.shaderType == ShaderTarget::Unknown)
+					continue;
+
+				++enabledModifiedShaderCount;
+
+				if (!ModifiedShaderHasTargetLocked(modifiedShader.id))
+					return false;
+			}
+
+			return enabledModifiedShaderCount > 0;
+		}
+
+		bool PruneSatisfiedDiscoveryWorkLocked(size_t& outQueuedShaders, size_t& outPendingAnalyses, size_t& outPendingResults, bool& outShouldLog)
+		{
+			if (!AllEnabledModifiedShadersHaveTargetsLocked())
+				return false;
+
+			outQueuedShaders = gQueuedShaders.size();
+			outPendingAnalyses = gAnalysisJobs.size();
+			outPendingResults = gAnalysisResults.size();
+
+			gQueueEvictedTotal += outQueuedShaders + outPendingAnalyses;
+
+			if (gAnalysisSubmittedTotal >= outPendingAnalyses)
+				gAnalysisSubmittedTotal -= outPendingAnalyses;
+			else
+				gAnalysisSubmittedTotal = 0;
+
+			gQueuedShaders.clear();
+			gAnalysisJobs.clear();
+			gAnalysisResults.clear();
+			gAnalysisCondition.notify_all();
+
+			outShouldLog = !gDiscoverySatisfiedLogged;
+			gDiscoverySatisfiedLogged = true;
+			return true;
+		}
+
+		uint64_t ProcessedShaderTotalLocked()
+		{
+			return gAnalysisCompletedTotal + gDirectMatchProcessedTotal;
+		}
+
+		//an empty queue is already complete, so report its percentage as 100.
+		double DiscoveryPercentage(uint64_t completed, uint64_t total)
+		{
+			if (total > 0)
+				return static_cast<double>(completed) * 100.0 / static_cast<double>(total);
+			return 100.0;
+		}
+
+		bool HasPendingDiscoveryWorkLocked()
+		{
+			return !gQueuedShaders.empty() ||
+				   !gAnalysisJobs.empty() ||
+				   !gAnalysisResults.empty() ||
+				   gActiveAnalysisJobs > 0;
+		}
+
+		std::string BuildDiscoveryProgressMessageLocked(const char* reason)
+		{
+			const uint64_t processedTotal = ProcessedShaderTotalLocked();
+			const uint64_t resolvedTotal = processedTotal + gQueueEvictedTotal;
+			uint64_t rejectedTotal = 0;
+			if (gAnalysisCompletedTotal >= gAnalysisMatchedTotal)
+				rejectedTotal = gAnalysisCompletedTotal - gAnalysisMatchedTotal;
+			const double processedPercent = DiscoveryPercentage(processedTotal, gQueuedShaderTotal);
+			const double resolvedPercent = DiscoveryPercentage(resolvedTotal, gQueuedShaderTotal);
+			const double analysisPercent = DiscoveryPercentage(gAnalysisCompletedTotal, gAnalysisSubmittedTotal);
+
+			const std::string processedPercentText = StringHelper::Format("%.1f", processedPercent);
+			const std::string resolvedPercentText = StringHelper::Format("%.1f", resolvedPercent);
+			const std::string analysisPercentText = StringHelper::Format("%.1f", analysisPercent);
+
+			return "ShaderAutomaticDiscovery->Progress: " + std::string(reason) +
+				   " processed=" + std::to_string(processedTotal) + "/" + std::to_string(gQueuedShaderTotal) +
+				   " (" + processedPercentText + "%)" +
+				   " resolved=" + std::to_string(resolvedTotal) + "/" + std::to_string(gQueuedShaderTotal) +
+				   " (" + resolvedPercentText + "%)" +
+				   " mode=" + ShaderDiscoveryModeName() +
+				   " analyzed=" + std::to_string(gAnalysisCompletedTotal) + "/" + std::to_string(gAnalysisSubmittedTotal) +
+				   " (" + analysisPercentText + "%)" +
+				   " directMatches=" + std::to_string(gDirectMatchProcessedTotal) +
+				   " analysisMatches=" + std::to_string(gAnalysisMatchedTotal) +
+				   " analysisRejected=" + std::to_string(rejectedTotal) +
+				   " analysisFailed=" + std::to_string(gAnalysisFailedTotal) +
+				   " targetsCreated=" + std::to_string(gShaderTargetsCreatedTotal) +
+				   " byteLengthRejected=" + std::to_string(gByteLengthRejectedTotal) +
+				   " queueDropped=" + std::to_string(gQueueDroppedTotal) +
+				   " queueEvicted=" + std::to_string(gQueueEvictedTotal) +
+				   " analysisPreempted=" + std::to_string(gAnalysisPreemptedTotal) +
+				   " queued=" + std::to_string(gQueuedShaders.size()) +
+				   " pendingAnalysis=" + std::to_string(gAnalysisJobs.size()) +
+				   " activeAnalysis=" + std::to_string(gActiveAnalysisJobs) +
+				   " pendingResults=" + std::to_string(gAnalysisResults.size()) +
+				   " workerThreads=" + std::to_string(ConfiguredAnalysisWorkerThreadCount()) +
+				   " workerThreadPriority=" + std::to_string(Globals::gShaderDiscoveryWorkerThreadPriority) +
+				   " frameJobBudget=" + std::to_string((std::clamp)(Globals::gShaderDiscoveryFrameJobBudget, 1, 65536)) +
+				   " pendingAnalysisLimit=" + std::to_string(ConfiguredPendingAnalysisLimit()) +
+				   " queuedShaderLimit=" + std::to_string(ConfiguredQueuedShaderLimit()) +
+				   " minimumSimilarityScore=" + std::to_string(Globals::gShaderDiscoveryMinimumSimilarityScore) +
+				   " similarityAmbiguityMargin=" + std::to_string(Globals::gShaderDiscoverySimilarityAmbiguityMargin);
+		}
+
+		void LogMissingModifiedShaderTargets();
+
+		void MaybeLogDiscoveryProgress(const char* reason, bool force = false)
+		{
+			std::string progressMessage;
+
+			bool logMissingTargets = false;
+			{
+				std::lock_guard<std::mutex> lock(gQueueMutex);
+				const auto now = std::chrono::steady_clock::now();
+				const bool active = HasPendingDiscoveryWorkLocked();
+				const uint64_t processedTotal = ProcessedShaderTotalLocked();
+				const bool completedEnoughWork = processedTotal >= gLastLoggedProcessedTotal + progressLogCompletedStep;
+				const bool queuedEnoughWork = gQueuedShaderTotal >= gLastLoggedQueuedTotal + progressLogQueuedStep;
+				const bool waitedLongEnough = gLastProgressLogTime.time_since_epoch().count() == 0 || now - gLastProgressLogTime >= progressLogInterval;
+				const bool justFinished = gProgressWasActive && !active;
+
+				if (!force && !justFinished && (!active || (!completedEnoughWork && !queuedEnoughWork && !waitedLongEnough)))
+					return;
+
+				const char* progressReason = reason;
+				if (justFinished)
+					progressReason = "complete";
+				progressMessage = BuildDiscoveryProgressMessageLocked(progressReason);
+				gLastLoggedProcessedTotal = processedTotal;
+				gLastLoggedQueuedTotal = gQueuedShaderTotal;
+				gLastProgressLogTime = now;
+				gProgressWasActive = active;
+				logMissingTargets = justFinished;
+			}
+
+			ShaderInjectorGUI::WriteToRuntimeLog(progressMessage);
+
+			if (logMissingTargets)
+				LogMissingModifiedShaderTargets();
+		}
+
+		void MarkAnalysisCompleted(bool matched, bool failed)
+		{
+			std::lock_guard<std::mutex> lock(gQueueMutex);
+
+			if (gActiveAnalysisJobs > 0)
+				--gActiveAnalysisJobs;
+
+			++gAnalysisCompletedTotal;
+
+			if (matched)
+				++gAnalysisMatchedTotal;
+
+			if (failed)
+				++gAnalysisFailedTotal;
+		}
+
+		void MarkShaderTargetCreated(const std::string& modifiedShaderId)
+		{
+			std::lock_guard<std::mutex> lock(gQueueMutex);
+			++gShaderTargetsCreatedTotal;
+
+			if (!modifiedShaderId.empty())
+				gModifiedShadersWithGeneratedTargets.insert(modifiedShaderId);
+		}
+
+		void MarkModifiedShaderCoveredByExistingTarget(const std::string& modifiedShaderId)
+		{
+			if (modifiedShaderId.empty())
+				return;
+
+			std::lock_guard<std::mutex> lock(gQueueMutex);
+			gModifiedShadersWithGeneratedTargets.insert(modifiedShaderId);
+		}
+
+		void LogMissingModifiedShaderTargets()
+		{
+			std::unordered_set<std::string> modifiedShaderIdsWithTargets;
+			{
+				std::lock_guard<std::mutex> lock(gQueueMutex);
+				modifiedShaderIdsWithTargets = gModifiedShadersWithGeneratedTargets;
+			}
+
+			if (HookD3D12::gLoadedShaderTargetsOnce)
+			{
+				for (const ShaderTarget::ShaderTargetDisk& shaderTarget : HookD3D12::gLoadedShaderTargets)
+				{
+					if (!shaderTarget.modifiedShaderId.empty())
+						modifiedShaderIdsWithTargets.insert(shaderTarget.modifiedShaderId);
+				}
+			}
+
+			size_t enabledModifiedShaderCount = 0;
+			size_t modifiedShadersWithTargets = 0;
+
+			for (const ModifiedShader::ModifiedShaderPackageDisk& modifiedShader : DatabaseModifiedShaders::GetModifiedShaders())
+			{
+				if (!modifiedShader.enabled || modifiedShader.shaderType == ShaderTarget::Unknown)
+					continue;
+
+				++enabledModifiedShaderCount;
+
+				if (modifiedShaderIdsWithTargets.find(modifiedShader.id) != modifiedShaderIdsWithTargets.end())
+				{
+					++modifiedShadersWithTargets;
+					continue;
+				}
+
+				ShaderInjectorGUI::WriteToRuntimeLogWarning(
+					"ShaderAutomaticDiscovery->Summary: no ShaderTarget generated for ModifiedShader id=" +
+					modifiedShader.id +
+					" name=\"" + modifiedShader.name + "\"" +
+					" shaderType=" + StringHelper::ShaderTypeToString(modifiedShader.shaderType) +
+					" knownTargets=" + std::to_string(modifiedShader.targets.size()));
+			}
+
+			ShaderInjectorGUI::WriteToRuntimeLog(
+				"ShaderAutomaticDiscovery->Summary: ModifiedShaders with ShaderTargets=" +
+				std::to_string(modifiedShadersWithTargets) + "/" + std::to_string(enabledModifiedShaderCount));
+		}
+
+		//pipeline descriptions keep raw pointers, so refresh them after bytecode vectors move.
+		template <typename Value>
+		Value* DataOrNull(std::vector<Value>& values)
+		{
+			if (values.empty())
+				return nullptr;
+			return values.data();
+		}
+
+		void RebindGraphicsPipelinePointers(HookD3D12::GraphicsPipelineInfo& pipeline)
+		{
+			pipeline.originalDescription.VS = {DataOrNull(pipeline.vertexShaderBytecode), pipeline.vertexShaderBytecode.size()};
+			pipeline.originalDescription.PS = {DataOrNull(pipeline.pixelShaderBytecode), pipeline.pixelShaderBytecode.size()};
+			pipeline.originalDescription.GS = {DataOrNull(pipeline.geometryShaderBytecode), pipeline.geometryShaderBytecode.size()};
+			pipeline.originalDescription.HS = {DataOrNull(pipeline.hullShaderBytecode), pipeline.hullShaderBytecode.size()};
+			pipeline.originalDescription.DS = {DataOrNull(pipeline.domainShaderBytecode), pipeline.domainShaderBytecode.size()};
+			pipeline.originalDescription.InputLayout.pInputElementDescs = DataOrNull(pipeline.inputElements);
+			pipeline.originalDescription.InputLayout.NumElements = static_cast<UINT>(pipeline.inputElements.size());
+			pipeline.originalDescription.StreamOutput.pSODeclaration = DataOrNull(pipeline.streamOutputDeclarations);
+			pipeline.originalDescription.StreamOutput.NumEntries = static_cast<UINT>(pipeline.streamOutputDeclarations.size());
+			pipeline.originalDescription.StreamOutput.pBufferStrides = DataOrNull(pipeline.streamOutputStrides);
+			pipeline.originalDescription.StreamOutput.NumStrides = static_cast<UINT>(pipeline.streamOutputStrides.size());
+		}
+
+		bool Enqueue(
+			PipelineSource source,
+			ID3D12PipelineState* pipelineState,
+			int pipelineIndex,
+			ShaderTarget::ShaderType shaderType,
+			uint64_t shaderHash,
+			const std::vector<uint8_t>& shaderBytecode,
+			bool force)
+		{
+			if (!pipelineState || shaderHash == 0 || shaderBytecode.empty())
+				return false;
+
+			const ShaderIdentityKey shaderKey{shaderHash, shaderType};
+			std::lock_guard<std::mutex> lock(gQueueMutex);
+
+			if (!gAcceptingWork)
+				return false;
+
+			if (!force && AllEnabledModifiedShadersHaveTargetsLocked())
+				return true;
+
+			const size_t shaderTypeIndex = static_cast<size_t>(shaderType);
+
+			if (shaderTypeIndex >= static_cast<size_t>(ShaderTarget::Unknown) || !gCompatibleShaderTypes[shaderTypeIndex])
+				return true;
+
+			gSeenShaderTypes[shaderTypeIndex] = true;
+			const auto directMatchIterator = gDirectMatchShaders.find(shaderKey);
+			const bool directMatch = directMatchIterator != gDirectMatchShaders.end() &&
+									 !directMatchIterator->second.empty();
+
+			if (!directMatch && Globals::gShaderDiscoveryMode == Globals::ShaderDiscoveryMode::HashLookup)
+				return true;
+
+			//PSOs are only ever created once by the game and never recreated, so this is the
+			//only chance a shader ever gets to be queued - anything rejected here is gone for
+			//the rest of the session. PixelShaders are rare enough (unlike ComputeShaders, which
+			//this filter genuinely needs to hold back) that there's no reason to risk losing one
+			//forever over a byte-length guess; let full analysis be the only judge for them.
+			if (!force && !directMatch && shaderType != ShaderTarget::PixelShader && !HasPlausibleByteLength(shaderType, shaderBytecode.size()))
+			{
+				++gByteLengthRejectedTotal;
+				return true;
+			}
+
+			if (!force && !gSubmittedShaders.insert(shaderKey).second)
+				return true;
+
+			if (force)
+			{
+				gSubmittedShaders.insert(shaderKey);
+
+				for (auto queuedIterator = gQueuedShaders.begin(); queuedIterator != gQueuedShaders.end();)
+				{
+					if (queuedIterator->shaderKey == shaderKey)
+						queuedIterator = gQueuedShaders.erase(queuedIterator);
+					else
+						++queuedIterator;
+				}
+			}
+
+			const double queuePriority = CalculateQueuePriorityLocked(shaderType, shaderBytecode.size(), force, directMatch);
+			const size_t queuedShaderLimit = ConfiguredQueuedShaderLimit();
+
+			if (gQueuedShaders.size() >= queuedShaderLimit)
+			{
+				auto lowestPriorityIterator = FindLowestPriorityQueuedShaderLocked();
+
+				if (lowestPriorityIterator == gQueuedShaders.end())
+				{
+					gSubmittedShaders.erase(shaderKey);
+					++gQueueDroppedTotal;
+					return false;
+				}
+
+				//Same one-shot reasoning as the byte-length gate above: a PixelShader that gets
+				//dropped here never gets a second chance. PixelShaders are rare enough that it's
+				//always worth evicting whatever the current lowest-priority queued shader is
+				//(almost always a ComputeShader) to make room, rather than risking losing this
+				//one forever.
+				if (!force && shaderType != ShaderTarget::PixelShader && queuePriority <= lowestPriorityIterator->priority)
+				{
+					gSubmittedShaders.erase(shaderKey);
+					++gQueueDroppedTotal;
+					return false;
+				}
+
+				gSubmittedShaders.erase(lowestPriorityIterator->shaderKey);
+				gQueuedShaders.erase(lowestPriorityIterator);
+				++gQueueEvictedTotal;
+			}
+
+			QueuedShader queued{};
+			queued.shaderKey = shaderKey;
+			queued.source = source;
+			queued.pipelineIndex = pipelineIndex;
+			queued.priority = queuePriority;
+			queued.pipelineState = pipelineState;
+			queued.shaderBytecode = shaderBytecode;
+
+			if (force || directMatch)
+				gQueuedShaders.push_front(std::move(queued));
+			else
+				gQueuedShaders.push_back(std::move(queued));
+
+			++gQueuedShaderTotal;
+
+			return true;
+		}
+
+		bool CopyGraphicsPipeline(
+			ID3D12PipelineState* pipelineState,
+			ShaderTarget::ShaderType shaderType,
+			uint64_t shaderHash,
+			HookD3D12::GraphicsPipelineInfo& outPipeline)
+		{
+			std::lock_guard<std::mutex> lock(HookD3D12::gPipelineMutex);
+
+			for (const HookD3D12::GraphicsPipelineInfo& pipeline : HookD3D12::gGraphicsPipelines)
+			{
+				if (pipeline.pipelineState != pipelineState)
+					continue;
+
+				uint64_t pipelineShaderHash = 0;
+				switch (shaderType)
+				{
+				case ShaderTarget::VertexShader:
+					pipelineShaderHash = pipeline.vertexShaderHash;
+					break;
+				case ShaderTarget::HullShader:
+					pipelineShaderHash = pipeline.hullShaderHash;
+					break;
+				case ShaderTarget::DomainShader:
+					pipelineShaderHash = pipeline.domainShaderHash;
+					break;
+				case ShaderTarget::GeometryShader:
+					pipelineShaderHash = pipeline.geometryShaderHash;
+					break;
+				case ShaderTarget::PixelShader:
+					pipelineShaderHash = pipeline.pixelShaderHash;
+					break;
+				default:
+					break;
+				}
+				if (pipelineShaderHash != shaderHash)
+					continue;
+
+				outPipeline = pipeline;
+
+				if (outPipeline.originalDescription.pRootSignature)
+					outPipeline.originalDescription.pRootSignature->AddRef();
+
+				RebindGraphicsPipelinePointers(outPipeline);
+
+				return true;
+			}
+
+			return false;
+		}
+
+		bool CopyStreamPipeline(
+			ID3D12PipelineState* pipelineState,
+			ShaderTarget::ShaderType shaderType,
+			uint64_t shaderHash,
+			HookD3D12::PipelineStateInfo& outPipeline)
+		{
+			std::lock_guard<std::mutex> lock(HookD3D12::gPipelineMutex);
+
+			for (const HookD3D12::PipelineStateInfo& pipeline : HookD3D12::gPipelineStates)
+			{
+				if (pipeline.pipelineState != pipelineState ||
+					!HookD3D12::StreamPipelineHasShaderHash(pipeline, shaderType, shaderHash))
+					continue;
+
+				outPipeline = pipeline;
+
+				if (outPipeline.rootSignature)
+					outPipeline.rootSignature->AddRef();
+
+				HookD3D12::RebindPipelineStateInfoPointerFields(outPipeline);
+
+				return true;
+			}
+
+			return false;
+		}
+
+		template <typename PipelineType>
+		bool CreateTargetForMatch(
+			const char* sourceList,
+			PipelineType& pipeline,
+			const QueuedShader& queued,
+			const std::string& modifiedShaderId,
+			const ShaderAnalysis::ShaderAnalysisDisk* shaderAnalysis)
+		{
+			if (!HookD3D12::CreateShaderTargetForPipeline(
+					sourceList,
+					queued.pipelineIndex,
+					queued.shaderKey.shaderType,
+					queued.shaderKey.shaderHash,
+					queued.shaderBytecode.size(),
+					queued.shaderBytecode.data(),
+					pipeline,
+					modifiedShaderId,
+					false,
+					shaderAnalysis))
+			{
+				return false;
+			}
+
+			HookD3D12::QueueShaderTargetApplyWork();
+			MarkShaderTargetCreated(modifiedShaderId);
+			ShaderInjectorGUI::WriteToRuntimeLogSuccess(
+				"ShaderAutomaticDiscovery: created ShaderTarget for " + Hash::FormatHash(queued.shaderKey.shaderHash) +
+				" using " + modifiedShaderId);
+			return true;
+		}
+
+		void ProcessMatchedShader(QueuedShader& queued, const std::string& modifiedShaderId, const ShaderAnalysis::ShaderAnalysisDisk* shaderAnalysis = nullptr)
+		{
+			if (!HookD3D12::gLoadedShaderTargetsOnce)
+				HookD3D12::RefreshLoadedShaderTargets();
+
+			for (int targetIndex = 0; targetIndex < static_cast<int>(HookD3D12::gLoadedShaderTargets.size()); ++targetIndex)
+			{
+				const ShaderTarget::ShaderTargetDisk& existingTarget = HookD3D12::gLoadedShaderTargets[targetIndex];
+
+				if (existingTarget.shaderType != queued.shaderKey.shaderType || !TargetContainsHash(existingTarget, queued.shaderKey.shaderHash))
+					continue;
+
+				if (existingTarget.modifiedShaderId != modifiedShaderId)
+				{
+					ShaderInjectorGUI::WriteToRuntimeLogWarning(
+						"ShaderAutomaticDiscovery: shader " + Hash::FormatHash(queued.shaderKey.shaderHash) +
+						" already belongs to a target using a different ModifiedShader; treating " +
+						modifiedShaderId + " as covered by " + existingTarget.modifiedShaderId);
+					MarkModifiedShaderCoveredByExistingTarget(modifiedShaderId);
+					return;
+				}
+
+				if (!existingTarget.enabled)
+					return;
+
+				const ModifiedShader::ModifiedShaderPackageDisk* existingPackage = DatabaseModifiedShaders::FindModifiedShaderById(modifiedShaderId);
+
+				if (existingPackage && existingPackage->compiledBlob.empty())
+				{
+					if (!DatabaseModifiedShaders::CompileModifiedShader(modifiedShaderId) || !HookD3D12::ReloadShaderTarget(targetIndex))
+						return;
+				}
+
+				HookD3D12::QueueShaderTargetApplyWork();
+				return;
+			}
+
+			const ModifiedShader::ModifiedShaderPackageDisk* selectedPackage = DatabaseModifiedShaders::FindModifiedShaderById(modifiedShaderId);
+
+			if (!selectedPackage)
+				return;
+
+			if (ModifiedShaderAlreadyHasGeneratedTarget(modifiedShaderId))
+			{
+				ShaderInjectorGUI::WriteToRuntimeLogWarning("ShaderAutomaticDiscovery: skipped duplicate ShaderTarget candidate " + Hash::FormatHash(queued.shaderKey.shaderHash) + " for " + modifiedShaderId);
+				return;
+			}
+
+			if (selectedPackage->compiledBlob.empty() && !DatabaseModifiedShaders::CompileModifiedShader(modifiedShaderId))
+			{
+				ShaderInjectorGUI::WriteToRuntimeLogError("ShaderAutomaticDiscovery: failed to compile " + modifiedShaderId);
+				return;
+			}
+
+			if (queued.source == PipelineSource::Graphics)
+			{
+				HookD3D12::GraphicsPipelineInfo pipeline{};
+
+				if (CopyGraphicsPipeline(
+						queued.pipelineState.Get(), queued.shaderKey.shaderType, queued.shaderKey.shaderHash, pipeline))
+				{
+					CreateTargetForMatch("Graphics", pipeline, queued, modifiedShaderId, shaderAnalysis);
+
+					if (pipeline.originalDescription.pRootSignature)
+						pipeline.originalDescription.pRootSignature->Release();
+				}
+			}
+			else
+			{
+				HookD3D12::PipelineStateInfo pipeline{};
+
+				if (CopyStreamPipeline(
+						queued.pipelineState.Get(), queued.shaderKey.shaderType, queued.shaderKey.shaderHash, pipeline))
+				{
+					CreateTargetForMatch("Stream", pipeline, queued, modifiedShaderId, shaderAnalysis);
+
+					if (pipeline.rootSignature)
+						pipeline.rootSignature->Release();
+				}
+			}
+		}
+
+		void AnalysisWorkerMain()
+		{
+			SetThreadPriority(GetCurrentThread(), Globals::gShaderDiscoveryWorkerThreadPriority);
+			const HRESULT comInitializationResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+			for (;;)
+			{
+				AnalysisJob job{};
+				{
+					std::unique_lock<std::mutex> lock(gQueueMutex);
+					gAnalysisCondition.wait(lock, []
+											{ return gAnalysisStopRequested || !gAnalysisJobs.empty(); });
+
+					if (gAnalysisStopRequested && gAnalysisJobs.empty())
+						break;
+
+					if (!PopHighestPriorityAnalysisJobLocked(job))
+						continue;
+					++gActiveAnalysisJobs;
+				}
+
+				try
+				{
+					ShaderAnalysis::ShaderAnalysisDisk candidateAnalysis{};
+					const int modifiedShaderIndex = ShaderDiscovery::DiscoverEnabledModifiedShader(
+						job.queuedShader.shaderKey.shaderHash,
+						job.queuedShader.shaderKey.shaderType,
+						job.queuedShader.shaderBytecode,
+						*job.modifiedShaders,
+						&candidateAnalysis);
+
+					if (modifiedShaderIndex < 0 || modifiedShaderIndex >= static_cast<int>(job.modifiedShaders->size()))
+					{
+						MarkAnalysisCompleted(false, false);
+						continue;
+					}
+
+					AnalysisResult result{};
+					result.queuedShader = std::move(job.queuedShader);
+					result.modifiedShaderID = (*job.modifiedShaders)[modifiedShaderIndex].id;
+					result.shaderAnalysis = std::move(candidateAnalysis);
+					{
+						std::lock_guard<std::mutex> lock(gQueueMutex);
+						gAnalysisResults.push_back(std::move(result));
+					}
+
+					MarkAnalysisCompleted(true, false);
+				}
+				catch (...)
+				{
+					MarkAnalysisCompleted(false, true);
+					ShaderInjectorGUI::WriteToRuntimeLogError("ShaderAutomaticDiscovery: background shader analysis failed unexpectedly");
+				}
+			}
+
+			if (SUCCEEDED(comInitializationResult))
+				CoUninitialize();
+
+			//Last thread exiting must not clear gAnalysisWorkerRunning while others are still alive.
+			std::lock_guard<std::mutex> lock(gQueueMutex);
+
+			if (gRunningAnalysisWorkerCount > 0)
+				--gRunningAnalysisWorkerCount;
+
+			gAnalysisWorkerRunning = gRunningAnalysisWorkerCount > 0;
+		}
+
+		void EnsureAnalysisWorkerStartedLocked()
+		{
+			if (gAnalysisWorkerRunning)
+				return;
+
+			gAnalysisStopRequested = false;
+			const size_t analysisWorkerThreadCount = ConfiguredAnalysisWorkerThreadCount();
+			gAnalysisWorkers.reserve(analysisWorkerThreadCount);
+
+			for (size_t workerIndex = 0; workerIndex < analysisWorkerThreadCount; ++workerIndex)
+			{
+				++gRunningAnalysisWorkerCount;
+				gAnalysisWorkers.emplace_back(AnalysisWorkerMain);
+			}
+
+			gAnalysisWorkerRunning = true;
+		}
+
+		bool TrySubmitAnalysis(QueuedShader& queued)
+		{
+			std::lock_guard<std::mutex> lock(gQueueMutex);
+
+			if (!gModifiedShaderAnalysisSnapshot)
+				return false;
+
+			if (gAnalysisJobs.size() >= ConfiguredPendingAnalysisLimit())
+			{
+				auto lowestPriorityJob = FindLowestPriorityAnalysisJobLocked();
+
+				if (lowestPriorityJob == gAnalysisJobs.end() || queued.priority <= lowestPriorityJob->queuedShader.priority)
+					return false;
+
+				QueuedShader preemptedShader = std::move(lowestPriorityJob->queuedShader);
+				gAnalysisJobs.erase(lowestPriorityJob);
+				gQueuedShaders.push_back(std::move(preemptedShader));
+
+				if (gAnalysisSubmittedTotal > 0)
+					--gAnalysisSubmittedTotal;
+
+				++gAnalysisPreemptedTotal;
+			}
+
+			EnsureAnalysisWorkerStartedLocked();
+
+			AnalysisJob job{};
+			job.queuedShader = std::move(queued);
+			job.modifiedShaders = gModifiedShaderAnalysisSnapshot;
+			gAnalysisJobs.push_back(std::move(job));
+			++gAnalysisSubmittedTotal;
+			gAnalysisCondition.notify_one();
+			return true;
+		}
+
+		void CollectNeverSeenCompatibleShaderTypesForDiagnostic(std::vector<ShaderTarget::ShaderType>& outNeverSeenShaderTypes)
+		{
+			if (gNeverSeenShaderTypeDiagnosticLogged)
+				return;
+
+			if (!gSessionStartTimeInitialized)
+			{
+				gSessionStartTime = std::chrono::steady_clock::now();
+				gSessionStartTimeInitialized = true;
+				return;
+			}
+
+			if (std::chrono::steady_clock::now() - gSessionStartTime < neverSeenShaderTypeDiagnosticDelay)
+				return;
+
+			gNeverSeenShaderTypeDiagnosticLogged = true;
+
+			for (size_t shaderTypeIndex = 0; shaderTypeIndex < static_cast<size_t>(ShaderTarget::Unknown); ++shaderTypeIndex)
+			{
+				if (!gCompatibleShaderTypes[shaderTypeIndex] || gSeenShaderTypes[shaderTypeIndex])
+					continue;
+
+				outNeverSeenShaderTypes.push_back(static_cast<ShaderTarget::ShaderType>(shaderTypeIndex));
+			}
+		}
+
+		void LogNeverSeenCompatibleShaderTypes(const std::vector<ShaderTarget::ShaderType>& neverSeenShaderTypes)
+		{
+			if (neverSeenShaderTypes.empty())
+				return;
+
+			size_t enabledPackageCounts[static_cast<size_t>(ShaderTarget::Unknown) + 1]{};
+			size_t enabledReplacementCounts[static_cast<size_t>(ShaderTarget::Unknown) + 1]{};
+
+			for (const ModifiedShader::ModifiedShaderPackageDisk& modifiedShader : DatabaseModifiedShaders::GetModifiedShaders())
+			{
+				if (!modifiedShader.enabled || modifiedShader.shaderType == ShaderTarget::Unknown)
+					continue;
+
+				const size_t shaderTypeIndex = static_cast<size_t>(modifiedShader.shaderType);
+
+				if (shaderTypeIndex < static_cast<size_t>(ShaderTarget::Unknown))
+					++enabledPackageCounts[shaderTypeIndex];
+			}
+
+			if (HookD3D12::gLoadedShaderTargetsOnce)
+			{
+				for (const ShaderTarget::ShaderTargetDisk& replacement : HookD3D12::gLoadedShaderTargets)
+				{
+					if (!replacement.enabled || replacement.shaderType == ShaderTarget::Unknown)
+						continue;
+
+					const size_t shaderTypeIndex = static_cast<size_t>(replacement.shaderType);
+
+					if (shaderTypeIndex < static_cast<size_t>(ShaderTarget::Unknown))
+						++enabledReplacementCounts[shaderTypeIndex];
+				}
+			}
+
+			for (ShaderTarget::ShaderType shaderType : neverSeenShaderTypes)
+			{
+				const size_t shaderTypeIndex = static_cast<size_t>(shaderType);
+				ShaderInjectorGUI::WriteToRuntimeLogError(
+					"ShaderAutomaticDiscovery->MaybeLogNeverSeenCompatibleShaderTypes: no capture attempt for " +
+					StringHelper::ShaderTypeToString(shaderType) +
+					" enabledPackages=" + std::to_string(enabledPackageCounts[shaderTypeIndex]) +
+					" enabledReplacements=" + std::to_string(enabledReplacementCounts[shaderTypeIndex]));
+			}
+		}
+	} //namespace
+
+	void RefreshModifiedShaderIndex(const std::vector<ModifiedShader::ModifiedShaderPackageDisk>& modifiedShaders)
+	{
+		auto analysisSnapshot = std::make_shared<std::vector<ModifiedShader::ModifiedShaderPackageDisk>>(modifiedShaders);
+
+		for (ModifiedShader::ModifiedShaderPackageDisk& modifiedShader : *analysisSnapshot)
+			modifiedShader.compiledBlob.clear();
+
+		std::lock_guard<std::mutex> lock(gQueueMutex);
+		gModifiedShaderAnalysisSnapshot = std::move(analysisSnapshot);
+		gDirectMatchShaders.clear();
+		gModifiedShadersWithGeneratedTargets.clear();
+		gDiscoverySatisfiedLogged = false;
+
+		for (bool& compatibleShaderType : gCompatibleShaderTypes)
+			compatibleShaderType = false;
+
+		for (bool& seenShaderType : gSeenShaderTypes)
+			seenShaderType = false;
+
+		for (auto& ranges : gPlausibleByteLengthRanges)
+			ranges.clear();
+
+		for (const ModifiedShader::ModifiedShaderPackageDisk& modifiedShader : modifiedShaders)
+		{
+			if (!modifiedShader.enabled || modifiedShader.shaderType == ShaderTarget::Unknown)
+				continue;
+
+			const size_t shaderTypeIndex = static_cast<size_t>(modifiedShader.shaderType);
+
+			if (shaderTypeIndex >= static_cast<size_t>(ShaderTarget::Unknown))
+				continue;
+
+			gCompatibleShaderTypes[shaderTypeIndex] = true;
+
+			for (const ModifiedShader::ModifiedShaderTargetDisk& target : modifiedShader.targets)
+			{
+				size_t targetByteLength = 0;
+
+				if (ParseByteLength(target.originalShaderBytecodeLength, targetByteLength))
+					AddPlausibleByteLengthRange(modifiedShader.shaderType, targetByteLength);
+
+				for (const std::string& knownHash : target.knownShaderBytecodeHashes)
+				{
+					const uint64_t parsedHash = Hash::ParseHashText(knownHash);
+
+					if (parsedHash != 0)
+					{
+						const ShaderIdentityKey shaderKey{parsedHash, modifiedShader.shaderType};
+						auto [directMatch, inserted] = gDirectMatchShaders.emplace(shaderKey, modifiedShader.id);
+
+						if (!inserted && directMatch->second != modifiedShader.id)
+							directMatch->second.clear();
+					}
+				}
+			}
+		}
+
+		MergePlausibleByteLengthRanges();
+	}
+
+	void ProcessQueuedWork(size_t maximumJobs)
+	{
+		auto pruneSatisfiedDiscoveryWork = []() -> bool
+		{
+			size_t prunedQueuedShaders = 0;
+			size_t prunedPendingAnalyses = 0;
+			size_t prunedPendingResults = 0;
+
+			bool shouldLog = false;
+			{
+				std::lock_guard<std::mutex> lock(gQueueMutex);
+
+				if (!PruneSatisfiedDiscoveryWorkLocked(prunedQueuedShaders, prunedPendingAnalyses, prunedPendingResults, shouldLog))
+					return false;
+			}
+
+			const bool prunedAnyWork = prunedQueuedShaders > 0 || prunedPendingAnalyses > 0 || prunedPendingResults > 0;
+
+			if (shouldLog)
+			{
+				ShaderInjectorGUI::WriteToRuntimeLog(
+					"ShaderAutomaticDiscovery->ProcessQueuedWork: all enabled ModifiedShaders have ShaderTargets; pruned remaining discovery work queued=" +
+					std::to_string(prunedQueuedShaders) +
+					" pendingAnalysis=" + std::to_string(prunedPendingAnalyses) +
+					" pendingResults=" + std::to_string(prunedPendingResults));
+			}
+
+			if (shouldLog || prunedAnyWork)
+				MaybeLogDiscoveryProgress("satisfied", true);
+
+			return true;
+		};
+
+		std::vector<ShaderTarget::ShaderType> neverSeenShaderTypes;
+		{
+			std::lock_guard<std::mutex> lock(gQueueMutex);
+
+			if (!gAcceptingWork)
+				return;
+
+			CollectNeverSeenCompatibleShaderTypesForDiagnostic(neverSeenShaderTypes);
+		}
+
+		LogNeverSeenCompatibleShaderTypes(neverSeenShaderTypes);
+
+		if (pruneSatisfiedDiscoveryWork())
+			return;
+
+		//D3D12-facing completion work remains on the render thread.
+		for (size_t processedJobs = 0; processedJobs < maximumJobs; ++processedJobs)
+		{
+			AnalysisResult result{};
+			{
+				std::lock_guard<std::mutex> lock(gQueueMutex);
+
+				if (gAnalysisResults.empty())
+					break;
+
+				result = std::move(gAnalysisResults.front());
+				gAnalysisResults.pop_front();
+			}
+
+			ProcessMatchedShader(result.queuedShader, result.modifiedShaderID, &result.shaderAnalysis);
+		}
+
+		if (pruneSatisfiedDiscoveryWork())
+			return;
+
+		//Submit a bounded amount of new work each frame. Background workers process jobs concurrently.
+		for (size_t submittedJobs = 0; submittedJobs < maximumJobs; ++submittedJobs)
+		{
+			QueuedShader queued{};
+			std::string directModifiedShaderId;
+
+			{
+				std::lock_guard<std::mutex> lock(gQueueMutex);
+
+				if (!PopHighestPriorityQueuedShaderLocked(queued))
+					break;
+
+				const auto directMatch = gDirectMatchShaders.find(queued.shaderKey);
+
+				if (directMatch != gDirectMatchShaders.end())
+					directModifiedShaderId = directMatch->second;
+			}
+
+			if (!directModifiedShaderId.empty())
+			{
+				ProcessMatchedShader(queued, directModifiedShaderId);
+				{
+					std::lock_guard<std::mutex> lock(gQueueMutex);
+					++gDirectMatchProcessedTotal;
+				}
+
+				continue;
+			}
+
+			if (Globals::gShaderDiscoveryMode == Globals::ShaderDiscoveryMode::HashLookup)
+			{
+				std::lock_guard<std::mutex> lock(gQueueMutex);
+				++gDirectMatchProcessedTotal;
+				continue;
+			}
+
+			if (!TrySubmitAnalysis(queued))
+			{
+				std::lock_guard<std::mutex> lock(gQueueMutex);
+				gQueuedShaders.push_front(std::move(queued));
+				break;
+			}
+		}
+
+		MaybeLogDiscoveryProgress("active");
+	}
+
+	void Shutdown()
+	{
+		std::vector<std::thread> workers;
+		{
+			std::lock_guard<std::mutex> lock(gQueueMutex);
+			gAcceptingWork = false;
+			gQueuedShaders.clear();
+			gAnalysisJobs.clear();
+			gAnalysisResults.clear();
+			gSubmittedShaders.clear();
+			gDirectMatchShaders.clear();
+			gModifiedShadersWithGeneratedTargets.clear();
+			gModifiedShaderAnalysisSnapshot.reset();
+
+			if (gAnalysisWorkers.empty())
+				return;
+
+			gAnalysisStopRequested = true;
+			workers = std::move(gAnalysisWorkers);
+			gAnalysisCondition.notify_all();
+		}
+
+		for (std::thread& worker : workers)
+		{
+			if (worker.joinable())
+				worker.join();
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(gQueueMutex);
+			gAnalysisWorkerRunning = false;
+			gRunningAnalysisWorkerCount = 0;
+		}
+	}
+
+	void ProcessCapturedGraphicsPipeline(const HookD3D12::GraphicsPipelineInfo& pipeline)
+	{
+		Enqueue(PipelineSource::Graphics, pipeline.pipelineState, -1, ShaderTarget::VertexShader, pipeline.vertexShaderHash, pipeline.vertexShaderBytecode, false);
+		Enqueue(PipelineSource::Graphics, pipeline.pipelineState, -1, ShaderTarget::PixelShader, pipeline.pixelShaderHash, pipeline.pixelShaderBytecode, false);
+		Enqueue(PipelineSource::Graphics, pipeline.pipelineState, -1, ShaderTarget::GeometryShader, pipeline.geometryShaderHash, pipeline.geometryShaderBytecode, false);
+		Enqueue(PipelineSource::Graphics, pipeline.pipelineState, -1, ShaderTarget::HullShader, pipeline.hullShaderHash, pipeline.hullShaderBytecode, false);
+		Enqueue(PipelineSource::Graphics, pipeline.pipelineState, -1, ShaderTarget::DomainShader, pipeline.domainShaderHash, pipeline.domainShaderBytecode, false);
+	}
+
+	void ProcessCapturedStreamPipeline(const HookD3D12::PipelineStateInfo& pipeline)
+	{
+		Enqueue(PipelineSource::Stream, pipeline.pipelineState, -1, ShaderTarget::VertexShader, pipeline.vertexShaderHash, pipeline.vertexShaderBytecode, false);
+		Enqueue(PipelineSource::Stream, pipeline.pipelineState, -1, ShaderTarget::PixelShader, pipeline.pixelShaderHash, pipeline.pixelShaderBytecode, false);
+		Enqueue(PipelineSource::Stream, pipeline.pipelineState, -1, ShaderTarget::ComputeShader, pipeline.computeShaderHash, pipeline.computeShaderBytecode, false);
+		Enqueue(PipelineSource::Stream, pipeline.pipelineState, -1, ShaderTarget::GeometryShader, pipeline.geometryShaderHash, pipeline.geometryShaderBytecode, false);
+		Enqueue(PipelineSource::Stream, pipeline.pipelineState, -1, ShaderTarget::HullShader, pipeline.hullShaderHash, pipeline.hullShaderBytecode, false);
+		Enqueue(PipelineSource::Stream, pipeline.pipelineState, -1, ShaderTarget::DomainShader, pipeline.domainShaderHash, pipeline.domainShaderBytecode, false);
+		Enqueue(PipelineSource::Stream, pipeline.pipelineState, -1, ShaderTarget::AmplificationShader, pipeline.amplificationShaderHash, pipeline.amplificationShaderBytecode, false);
+		Enqueue(PipelineSource::Stream, pipeline.pipelineState, -1, ShaderTarget::MeshShader, pipeline.meshShaderHash, pipeline.meshShaderBytecode, false);
+	}
+
+	bool ProcessCapturedShader(
+		const HookD3D12::GraphicsPipelineInfo& pipeline,
+		int pipelineIndex,
+		ShaderTarget::ShaderType shaderType,
+		uint64_t shaderHash,
+		const std::vector<uint8_t>& shaderBytecode)
+	{
+		return Enqueue(PipelineSource::Graphics, pipeline.pipelineState, pipelineIndex, shaderType, shaderHash, shaderBytecode, true);
+	}
+
+	bool ProcessCapturedShader(
+		const HookD3D12::PipelineStateInfo& pipeline,
+		int pipelineIndex,
+		ShaderTarget::ShaderType shaderType,
+		uint64_t shaderHash,
+		const std::vector<uint8_t>& shaderBytecode)
+	{
+		return Enqueue(PipelineSource::Stream, pipeline.pipelineState, pipelineIndex, shaderType, shaderHash, shaderBytecode, true);
+	}
+} //namespace ShaderAutomaticDiscovery

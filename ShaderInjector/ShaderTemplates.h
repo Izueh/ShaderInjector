@@ -1,21 +1,24 @@
 #pragma once
 
 //custom
-#include "ShaderInjectorIO.h"
-#include "ShaderTarget.h"
+#include "IO/ShaderInjectorIO.h"
+#include "ShaderTarget/ShaderTarget.h"
+#include <string>
+
+namespace ShaderAnalysis
+{
+	struct ShaderAnalysisDisk;
+}
 
 namespace ShaderTemplates
 {
 	const char* GetModifiedShaderSourceTemplate(ShaderTarget::ShaderType shaderType);
+	std::string BuildMeshShaderSourceTemplate(const ShaderAnalysis::ShaderAnalysisDisk& originalShader);
 
 	//NOTE: These are source code shader templates that the shader injector will auto-generate for various tasks.
 	//Now normally I would think it'd be wise to actually have these already serialized to the disk rather than holding them in memory.
 	//But... I do not trust users... so for sanity sake these will remain in memory.
 	//That way if anything goes wrong, we can just rebuild some of these shaders and it should still work...
-
-	//||||||||||||||||||||||||||||||||||||||||||||||||||||| PIXEL SHADER |||||||||||||||||||||||||||||||||||||||||||||||||||||
-	//||||||||||||||||||||||||||||||||||||||||||||||||||||| PIXEL SHADER |||||||||||||||||||||||||||||||||||||||||||||||||||||
-	//||||||||||||||||||||||||||||||||||||||||||||||||||||| PIXEL SHADER |||||||||||||||||||||||||||||||||||||||||||||||||||||
 
 	//NOTE TO SELF: watch those spaces!
 	static const char* internalMarkerPixelShaderSourceCode = R"(
@@ -41,13 +44,9 @@ float4 main() : SV_Target0
 }
 )";
 
-	//||||||||||||||||||||||||||||||||||||||||||||||||||||| COMPUTE SHADER |||||||||||||||||||||||||||||||||||||||||||||||||||||
-	//||||||||||||||||||||||||||||||||||||||||||||||||||||| COMPUTE SHADER |||||||||||||||||||||||||||||||||||||||||||||||||||||
-	//||||||||||||||||||||||||||||||||||||||||||||||||||||| COMPUTE SHADER |||||||||||||||||||||||||||||||||||||||||||||||||||||
-
 	//NOTE TO SELF: watch those spaces!
 	static const char* internalMarkerComputeShaderSourceCode = R"(
-struct InputStruct 
+struct InputStruct
 {
 	uint3 DispatchThreadID : SV_DispatchThreadID;
 };
@@ -59,4 +58,4 @@ void main(in InputStruct IN)
 }
 )";
 
-}
+} //namespace ShaderTemplates

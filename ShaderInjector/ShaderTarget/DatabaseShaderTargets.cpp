@@ -1,0 +1,157 @@
+//DatabaseShaderTargets.cpp
+#include <algorithm>
+#include <mutex>
+#include <string>
+#include <vector>
+
+//custom
+#include "DatabaseShaderTargets.h"
+#include "ModifiedShader/DatabaseModifiedShaders.h"
+#include "Globals.h"
+#include "HookD3D12.h"
+#include "ShaderDiscovery/ShaderDiscovery.h"
+#include "GUI/ShaderInjectorGUI.h"
+#include "IO/ShaderInjectorIO.h"
+#include "ShaderTarget.h"
+
+namespace HookD3D12
+{
+	//runtime mirror of the ShaderTargets directory
+	//JSON files are still the source of truth on disk.
+	std::vector<ShaderTarget::ShaderTargetDisk> gLoadedShaderTargets;
+
+	std::vector<std::vector<uint8_t>> gLoadedShaderTargetBlobs;
+	int gSelectedShaderTargetIndex = -1;
+	int gShaderTargetNameBufferIndex = -1;
+	char gShaderTargetNameBuffer[256]{};
+	bool gLoadedShaderTargetsOnce = false;
+
+	bool IsShaderTargetEffectivelyEnabled(const ShaderTarget::ShaderTargetDisk& replacement)
+	{
+		if (!replacement.enabled || replacement.modifiedShaderId.empty())
+			return false;
+
+		const ModifiedShader::ModifiedShaderPackageDisk* modifiedShader = DatabaseModifiedShaders::FindModifiedShaderById(replacement.modifiedShaderId);
+
+		return modifiedShader && modifiedShader->enabled &&
+			   modifiedShader->shaderType == replacement.shaderType &&
+			   DatabaseModifiedShaders::CompiledShaderMatchesTargetInterface(*modifiedShader, replacement.originalShaderAnalysis);
+	}
+
+	void RefreshShaderTargetsForModifiedShaderStateChange()
+	{
+		//existing replacement PSOs were built from the previous effective state.
+		//retire them before reloading linked blobs so the next apply pass either rebuilds from the enabled package or falls back to the original game PSO.
+		{
+			std::lock_guard<std::mutex> lock(gPipelineMutex);
+			InvalidateAllReplacementPSOs();
+		}
+
+		RefreshLoadedShaderTargets();
+	}
+
+	//recollect shader targets from the shader replacement folder, and load them into memory
+	void RefreshLoadedShaderTargets()
+	{
+		//rebuild the runtime list from disk so external edits or deleted replacement folders are reflected in the UI.
+		ResetCachedBlobContentLookup();
+		ShaderDiscovery::ResetRuntimeCache();
+		std::vector<ShaderTarget::ShaderTargetDisk> loadedTargets;
+		std::vector<std::vector<uint8_t>> loadedTargetBlobs;
+		gSelectedShaderTargetIndex = -1;
+		gShaderTargetNameBufferIndex = -1;
+		gShaderTargetNameBuffer[0] = '\0';
+
+		const std::string replacementDirectory = ShaderInjectorIO::GetShaderTargetsDirectory();
+		DatabaseModifiedShaders::EnsureModifiedShadersLoaded();
+
+		if (!ShaderInjectorIO::DirectoryExists(replacementDirectory))
+			ShaderInjectorIO::DirectoryCreate(replacementDirectory);
+
+		std::vector<std::string> replacementJsonPaths;
+		ShaderTarget::CollectShaderTargetJsonFiles(replacementDirectory, replacementJsonPaths);
+		std::sort(replacementJsonPaths.begin(), replacementJsonPaths.end());
+
+		for (const std::string& replacementJsonPath : replacementJsonPaths)
+		{
+			ShaderTarget::ShaderTargetDisk replacement{};
+
+			if (ShaderTarget::LoadShaderTargetJson(replacementJsonPath, replacement))
+			{
+				BackfillReplacementPortableMetadataFromSidecars(replacement);
+
+				if (Globals::gShaderDiscoveryMode == Globals::ShaderDiscoveryMode::ShaderAnalysis)
+					ShaderDiscovery::EnsureReplacementAnalysis(replacement);
+
+				std::vector<uint8_t> compiledReplacementBlob;
+
+				const ModifiedShader::ModifiedShaderPackageDisk* modifiedShader = DatabaseModifiedShaders::FindModifiedShaderById(replacement.modifiedShaderId);
+				replacement.modifiedShaderBlobPath.clear();
+				if (modifiedShader)
+					replacement.modifiedShaderBlobPath = modifiedShader->compiledBlobPath;
+
+				if (modifiedShader && IsShaderTargetEffectivelyEnabled(replacement))
+					compiledReplacementBlob = modifiedShader->compiledBlob;
+				else if (modifiedShader && modifiedShader->enabled && !modifiedShader->compiledBlob.empty() &&
+						 !DatabaseModifiedShaders::CompiledShaderMatchesTargetInterface(*modifiedShader, replacement.originalShaderAnalysis))
+				{
+					ShaderInjectorIO::WriteToLogFileError("DatabaseShaderTargets->RefreshLoadedShaderTargets: refusing incompatible compiled shader interface for " + replacement.name + " from " + modifiedShader->id);
+				}
+
+				loadedTargets.push_back(std::move(replacement));
+				loadedTargetBlobs.push_back(std::move(compiledReplacementBlob));
+			}
+		}
+
+		{
+			//publish the completed list atomically with retry reset; bind hooks cannot observe a partial refresh.
+			std::lock_guard<std::mutex> pipelineLock(gPipelineMutex);
+			gLoadedShaderTargets = std::move(loadedTargets);
+			gLoadedShaderTargetBlobs = std::move(loadedTargetBlobs);
+
+			if (!gLoadedShaderTargets.empty())
+				gSelectedShaderTargetIndex = 0;
+
+			ResetUncapturedReplacementAttempts();
+			gLoadedShaderTargetsOnce = true;
+		}
+
+		//IMPORTANT: let the rest of the injector know that our shader replacement is dirty (needs to be updated)
+		MarkShaderTargetApplyDirty();
+
+		ShaderInjectorGUI::WriteToRuntimeLog("DatabaseShaderTargets->RefreshLoadedShaderTargets: Loaded shader targets from disk: " + std::to_string(gLoadedShaderTargets.size()));
+
+		for (const auto& replacement : gLoadedShaderTargets)
+		{
+			int enabledFlag = 0;
+			if (replacement.enabled)
+				enabledFlag = 1;
+			ShaderInjectorGUI::WriteToRuntimeLog(
+				"DatabaseShaderTargets->RefreshLoadedShaderTargets: Replacement loaded: " + replacement.name +
+				" enabled=" + std::to_string(enabledFlag) +
+				" shaderHash=" + replacement.originalShaderBytecodeHash +
+				" cacheHash=" + replacement.pipelineCachedBlobHash +
+				" cacheBytes=" + replacement.pipelineCachedBlobLength +
+				" source=" + replacement.sourceList +
+				" index=" + replacement.pipelineIndex);
+		}
+	}
+
+	//utility function for UI
+	void SyncShaderTargetNameBuffer()
+	{
+		if (gSelectedShaderTargetIndex < 0 || gSelectedShaderTargetIndex >= (int)gLoadedShaderTargets.size())
+		{
+			gShaderTargetNameBufferIndex = -1;
+			gShaderTargetNameBuffer[0] = '\0';
+			return;
+		}
+
+		if (gShaderTargetNameBufferIndex == gSelectedShaderTargetIndex)
+			return;
+
+		const std::string& name = gLoadedShaderTargets[gSelectedShaderTargetIndex].name;
+		strncpy_s(gShaderTargetNameBuffer, name.c_str(), _TRUNCATE);
+		gShaderTargetNameBufferIndex = gSelectedShaderTargetIndex;
+	}
+} //namespace HookD3D12

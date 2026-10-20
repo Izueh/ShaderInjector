@@ -1,0 +1,38 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+#include "ShaderTarget/ShaderTarget.h"
+#include "ModifiedShader/ModifiedShader.h"
+
+namespace HookD3D12
+{
+	struct GraphicsPipelineInfo;
+	struct PipelineStateInfo;
+} //namespace HookD3D12
+
+namespace ShaderAutomaticDiscovery
+{
+	//Capture hooks only enqueue unique shaders. The render path drains a small,
+	//bounded amount of work so shader analysis cannot stall PSO creation threads.
+	void ProcessQueuedWork(size_t maximumJobs = 1);
+	void Shutdown();
+	void RefreshModifiedShaderIndex(const std::vector<ModifiedShader::ModifiedShaderPackageDisk>& modifiedShaders);
+	void ProcessCapturedGraphicsPipeline(const HookD3D12::GraphicsPipelineInfo& pipeline);
+	void ProcessCapturedStreamPipeline(const HookD3D12::PipelineStateInfo& pipeline);
+
+	bool ProcessCapturedShader(
+		const HookD3D12::GraphicsPipelineInfo& pipeline,
+		int pipelineIndex,
+		ShaderTarget::ShaderType shaderType,
+		uint64_t shaderHash,
+		const std::vector<uint8_t>& shaderBytecode);
+	bool ProcessCapturedShader(
+		const HookD3D12::PipelineStateInfo& pipeline,
+		int pipelineIndex,
+		ShaderTarget::ShaderType shaderType,
+		uint64_t shaderHash,
+		const std::vector<uint8_t>& shaderBytecode);
+} //namespace ShaderAutomaticDiscovery

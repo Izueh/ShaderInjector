@@ -63,6 +63,7 @@ In addition if you would like to do pull requests to improve or contribute featu
 - Improvements to automatic shader discovery.
 - Stability Improvements for Linux
 - General Bug / Issue Fixing
+- Shader Patch documentation.
 
 ---
 # Sources / References

@@ -4,12 +4,13 @@
 #include <cstdio>
 #include <string>
 
-//custom 
-#include "ShaderTarget.h"
+//custom
+#include "Globals.h"
+#include "ShaderTarget/ShaderTarget.h"
 
 namespace StringHelper
 {
-	template<typename... Arguments>
+	template <typename... Arguments>
 	std::string Format(const char* format, Arguments... arguments)
 	{
 		if (!format)
@@ -43,5 +44,9 @@ namespace StringHelper
 
 	std::string ShaderTypeToString(ShaderTarget::ShaderType shaderType);
 
+	bool IsValidShaderModel(Globals::ShaderModel shaderModel);
+	Globals::ShaderModel ShaderModelFromValue(int value, Globals::ShaderModel fallback);
+	std::string ShaderModelToString(Globals::ShaderModel shaderModel);
+
 	std::string ShaderProfileForType(ShaderTarget::ShaderType shaderType);
-}
+} //namespace StringHelper

@@ -12,6 +12,7 @@ InjectorEnabled=true
 MenuOpen=true
 MenuScale=1.0
 OpenMenuKey=45
+ShaderPatchesEnabled=true
 ToggleInjectorKey=36
 ```
 
@@ -19,6 +20,7 @@ ToggleInjectorKey=36
 - **MenuOpen:** *(true/false)* This sets whether the injector menu is visible on startup, or hidden on startup
 - **MenuScale:** *(decimal)* This scales the injector menu text and widgets. Default is 1.0 which is the original size, and values are clamped between 0.5 and 4.0. The menu is drawn inside the game at a fixed pixel size so it does not follow Windows display scaling, which makes it small and hard to read on high resolution displays. **On a 4K display 2.0 is a comfortable value.** This is applied when the menu is first created, so set it before booting the game.
 - **OpenMenuKey:** *(integer)* This is the keycode for opening or closisng the injector menu on the keypress. Default is [Insert / 45].
+- **ShaderPatchesEnabled:** *(true/false)* This sets whether patched shaders are drawn on startup, same as the **Enable Shader Patches** checkbox. Default is true.
 - **ToggleInjectorKey:** *(integer)* This is the keycode for enabling or disabling the injector on a keypress. Default is [Home / 36]
 
 *NOTE: if ini file has invalid values for these fields, the file will fail to parse and injector will use default settings.*
