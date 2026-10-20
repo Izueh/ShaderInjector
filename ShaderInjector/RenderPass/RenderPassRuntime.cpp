@@ -2745,8 +2745,7 @@ namespace RenderPassRuntime
 					}
 				}
 			}
-			else if (computePipeline &&
-					 renderPass.type == RenderPass::RenderPassType::Custom &&
+			else if (renderPass.type == RenderPass::RenderPassType::Custom &&
 					 RenderPass::ResolveExecutionMode(renderPass) == RenderPass::ExecutionMode::Compute &&
 					 (passOperation == RenderPass::PassOperation::Custom ||
 					  passOperation == RenderPass::PassOperation::Downsample ||
@@ -2757,9 +2756,31 @@ namespace RenderPassRuntime
 				executionAttempted = true;
 				captureShaderResourceState();
 
+				thread_local RenderPassMipChain::GraphicsStateSnapshot graphicsComputeState;
+				const RenderPassMipChain::GraphicsStateSnapshot* computeResourceState = &gShaderResourceState;
+				const RenderPassMipChain::GraphicsStateSnapshot* oppositeComputeResourceState = &gOppositeShaderResourceState;
+				ID3D12PipelineState* graphicsComputePipelineState = nullptr;
+				bool computeStateReady = true;
+
+				if (!computePipeline)
+				{
+					HookD3D12::ScopedRenderPassInjection injectionScope;
+					ShaderResourceRuntime::RestoreResourcesImmediately(commandList);
+					computeStateReady = RenderPassExecutor::PrepareGraphicsComputeState(renderPass, commandList, gShaderResourceState, graphicsComputeState, graphicsComputePipelineState, executionError);
+					computeResourceState = &graphicsComputeState;
+					oppositeComputeResourceState = &gShaderResourceState;
+
+					if (computeStateReady)
+						commandList->SetComputeRootSignature(graphicsComputeState.rootSignature);
+				}
+
 				thread_local std::vector<RenderPassTexturePool::TextureView> unorderedAccessOutputs;
 				unorderedAccessOutputs.clear();
-				if (passOperation == RenderPass::PassOperation::UpsampleChain)
+				if (!computeStateReady)
+				{
+					executionSucceeded = false;
+				}
+				else if (passOperation == RenderPass::PassOperation::UpsampleChain)
 				{
 					const RenderPass::LogicalResourceBindingDisk* sourceBinding =
 						FindRuntimeInput(renderPass, RenderPass::ResourceAccess::ShaderResource);
@@ -2780,10 +2801,10 @@ namespace RenderPassRuntime
 							stageTargets,
 							executionError))
 					{
-						ID3D12PipelineState* computePipelineState = RenderPassReplacement::GetOrCreatePipeline(
-							renderPass,
-							state.pipelineState,
-							executionError);
+						ID3D12PipelineState* computePipelineState = graphicsComputePipelineState;
+
+						if (computePipeline)
+							computePipelineState = RenderPassReplacement::GetOrCreatePipeline(renderPass, state.pipelineState, executionError);
 						executionSucceeded = computePipelineState != nullptr;
 						RenderPassTexturePool::TextureView stageSource = sourceTexture;
 						for (const RenderPassTexturePool::TextureView& stageTarget : stageTargets)
@@ -2799,8 +2820,8 @@ namespace RenderPassRuntime
 								resourcesBound = ShaderResourceRuntime::BindResources(
 									renderPass,
 									commandList,
-									gShaderResourceState,
-									gOppositeShaderResourceState,
+									*computeResourceState,
+									*oppositeComputeResourceState,
 									true,
 									executionError,
 									&textureOverride);
@@ -2877,19 +2898,19 @@ namespace RenderPassRuntime
 						shaderResourcesBound = ShaderResourceRuntime::BindResources(
 							renderPass,
 							commandList,
-							gShaderResourceState,
-							gOppositeShaderResourceState,
+							*computeResourceState,
+							*oppositeComputeResourceState,
 							true,
 							executionError);
 					}
 
-					ID3D12PipelineState* computePipelineState = nullptr;
-					if (shaderResourcesBound)
+					ID3D12PipelineState* computePipelineState = graphicsComputePipelineState;
+					if (shaderResourcesBound && computePipeline)
 						computePipelineState = RenderPassReplacement::GetOrCreatePipeline(renderPass, state.pipelineState, executionError);
 					UINT threadGroupCountX = 0;
 					UINT threadGroupCountY = 0;
 					UINT threadGroupCountZ = 0;
-					if (computePipelineState && ResolveComputeDispatch(
+					if (shaderResourcesBound && computePipelineState && ResolveComputeDispatch(
 													renderPass,
 													originalThreadGroupCountX,
 													originalThreadGroupCountY,
@@ -2916,6 +2937,14 @@ namespace RenderPassRuntime
 						ShaderResourceRuntime::RestoreResources(commandList);
 					}
 				}
+				if (!computePipeline && computeStateReady)
+				{
+					//descriptor heaps affect both pipelines; restore them before reinstating the game's compute arguments.
+					HookD3D12::ScopedRenderPassInjection injectionScope;
+					ShaderResourceRuntime::RestoreResourcesImmediately(commandList);
+					RenderPassExecutor::RestoreComputeState(commandList, gOppositeShaderResourceState);
+				}
+
 				if (executionSucceeded)
 					PerformanceMetrics::Increment(PerformanceMetrics::Counter::CustomPassSucceeded);
 			}
@@ -3121,8 +3150,7 @@ namespace RenderPassRuntime
 					unavailableRuntimeResources.insert(output.resourceId);
 			}
 
-			if (executionSucceeded)
-				RenderPassTexturePool::MarkPassOutputsWritten(renderPass);
+			RenderPassTexturePool::MarkPassOutputsWritten(renderPass, executionSucceeded);
 
 			const size_t renderPassIndex = static_cast<size_t>(
 				renderPassPointer - configuration->renderPasses.data());

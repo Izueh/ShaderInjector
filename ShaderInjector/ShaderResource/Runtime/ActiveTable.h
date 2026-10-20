@@ -13,6 +13,7 @@ namespace ShaderResourceRuntime
 		UINT rootParameterIndex = UINT32_MAX;
 		D3D12_DESCRIPTOR_HEAP_TYPE heapType = D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES;
 		UINT descriptorCount = 0;
+		UINT sourceDescriptorCount = 0;
 		D3D12_GPU_DESCRIPTOR_HANDLE originalGpu{};
 		D3D12_CPU_DESCRIPTOR_HANDLE originalCpu{};
 		DescriptorAllocation allocation;

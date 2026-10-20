@@ -39,6 +39,7 @@ namespace RenderPassTexturePool
 			uint64_t frameIndex = 0;
 		};
 		std::unordered_map<std::string, GeneratedMipEntry> gGeneratedMips;
+		std::unordered_map<std::string, uint64_t> gPublishedOutputFrames;
 		std::unordered_map<ID3D12GraphicsCommandList*, std::unordered_map<ID3D12Resource*, RecordedTextureVersion>> gRecordedTextures;
 		std::unordered_map<ID3D12CommandQueue*, QueueFence> gQueueFences;
 		std::unordered_map<ID3D12CommandQueue*, std::unordered_map<ID3D12Resource*, RecordedTextureVersion>> gPendingQueueTextures;
@@ -53,7 +54,6 @@ namespace RenderPassTexturePool
 		std::atomic<uint64_t> gConfigurationGeneration{1};
 		std::atomic<uint64_t> gTextureGeneration{1};
 		std::atomic<uint64_t> gFrameIndex{0};
-		std::atomic<bool> gHasHistoryResources{false};
 		thread_local std::vector<InputTextureOverride> gInputTextureOverrides;
 		thread_local size_t gExecutionScopeDepth = 0;
 		thread_local uint64_t gExecutionFrameIndex = 0;
@@ -567,6 +567,7 @@ namespace RenderPassTexturePool
 										   newEntry.versionCount;
 			}
 			newEntry.device = device;
+			gPublishedOutputFrames.erase(resourceId);
 			newEntry.definition = definition;
 			newEntry.description = resolvedDescription;
 			newEntry.generation = gTextureGeneration.load(std::memory_order_relaxed) + 1;
@@ -692,7 +693,8 @@ namespace RenderPassTexturePool
 	bool GetInputTexture(
 		const std::string& resourceId,
 		ShaderResource::TemporalView temporalView,
-		TextureView& outTexture)
+		TextureView& outTexture,
+		bool requireCurrentFrame)
 	{
 		for (auto overrideIt = gInputTextureOverrides.rbegin(); overrideIt != gInputTextureOverrides.rend(); ++overrideIt)
 		{
@@ -711,6 +713,29 @@ namespace RenderPassTexturePool
 				outTexture = generated->second.texture;
 				return outTexture.resource != nullptr;
 			}
+
+			if (requireCurrentFrame)
+			{
+				const auto published = gPublishedOutputFrames.find(resourceId);
+
+				if (published == gPublishedOutputFrames.end() || published->second != CurrentFrameIndex())
+				{
+					outTexture = {};
+					return false;
+				}
+
+				//resolve the exact published allocation under the same lock; another recording may resize this resource.
+				const auto texture = gTextures.find(resourceId);
+
+				if (texture == gTextures.end() || !FillTextureViewLocked(texture->second, temporalView, outTexture))
+				{
+					outTexture = {};
+					return false;
+				}
+
+				RecordTextureLocked(gExecutionCommandList, texture->second);
+				return true;
+			}
 		}
 		return GetTexture(resourceId, temporalView, outTexture);
 	}
@@ -718,7 +743,6 @@ namespace RenderPassTexturePool
 	void PublishConfigurations(const std::vector<RenderPass::RenderPassDisk>& renderPasses)
 	{
 		std::unordered_map<std::string, DefinitionRecord> definitions;
-		bool hasHistoryResources = false;
 		for (const RenderPass::RenderPassDisk& renderPass : renderPasses)
 		{
 			if (!renderPass.enabled)
@@ -736,8 +760,6 @@ namespace RenderPassTexturePool
 						"RenderPassTexturePool->PublishConfigurations: duplicate runtime resource id=" +
 						definition.id);
 				}
-				hasHistoryResources = hasHistoryResources ||
-									  definition.texture.lifetime == ShaderResource::ResourceLifetime::History;
 			}
 		}
 		//The first producer creates the allocation; include write capabilities needed by later aliases.
@@ -765,6 +787,7 @@ namespace RenderPassTexturePool
 		std::lock_guard<std::mutex> lock(gPoolMutex);
 		gDefinitions = std::move(definitions);
 		gGeneratedMips.clear();
+		gPublishedOutputFrames.clear();
 		gHistoryBootstrapTextures.clear();
 		for (auto textureIt = gTextures.begin(); textureIt != gTextures.end();)
 		{
@@ -780,7 +803,6 @@ namespace RenderPassTexturePool
 			}
 		}
 		gConfigurationGeneration.fetch_add(1, std::memory_order_release);
-		gHasHistoryResources.store(hasHistoryResources, std::memory_order_release);
 	}
 
 	bool GetHistoryBootstrapTexture(
@@ -829,13 +851,8 @@ namespace RenderPassTexturePool
 		return true;
 	}
 
-	void MarkPassOutputsWritten(const RenderPass::RenderPassDisk& renderPass)
+	void MarkPassOutputsWritten(const RenderPass::RenderPassDisk& renderPass, bool executionSucceeded)
 	{
-		const bool ownsHistory = std::any_of(renderPass.runtimeResources.begin(), renderPass.runtimeResources.end(),
-											 [](const auto& definition)
-											 { return definition.texture.lifetime == ShaderResource::ResourceLifetime::History; });
-		if (!ownsHistory)
-			return;
 		std::lock_guard<std::mutex> lock(gPoolMutex);
 		const uint64_t frameIndex = CurrentFrameIndex();
 		for (const auto& output : renderPass.outputs)
@@ -844,9 +861,17 @@ namespace RenderPassTexturePool
 				output.temporalView != ShaderResource::TemporalView::Current)
 				continue;
 			const auto texture = gTextures.find(output.resourceId);
-			if (texture != gTextures.end() && texture->second.versionCount > 1 &&
-				texture->second.definition.ownerRenderPassId == renderPass.id)
-				texture->second.versions[frameIndex % texture->second.versionCount].written = true;
+
+			if (!executionSucceeded)
+				gPublishedOutputFrames.erase(output.resourceId);
+			else if (texture != gTextures.end() && texture->second.versionCount && texture->second.definition.ownerRenderPassId == renderPass.id)
+			{
+				//a later execution anchor must never reuse last frame's atmosphere or another unwritten allocation.
+				gPublishedOutputFrames[output.resourceId] = frameIndex;
+
+				if (texture->second.versionCount > 1)
+					texture->second.versions[frameIndex % texture->second.versionCount].written = true;
+			}
 		}
 	}
 
@@ -1160,8 +1185,8 @@ namespace RenderPassTexturePool
 			gPendingQueueTextures.clear();
 			gHasPendingQueueTextures.store(false, std::memory_order_release);
 		}
-		if (gHasHistoryResources.load(std::memory_order_relaxed))
-			gFrameIndex.fetch_add(1, std::memory_order_release);
+		//transient cross-anchor outputs also expire at Present, even when no history textures are configured.
+		gFrameIndex.fetch_add(1, std::memory_order_release);
 	}
 
 	bool HasRecordedCommandListWork()
@@ -1216,6 +1241,7 @@ namespace RenderPassTexturePool
 		gHistoryBootstrapTextures.clear();
 		gTextures.clear();
 		gGeneratedMips.clear();
+		gPublishedOutputFrames.clear();
 		gRecordedTextures.clear();
 		gPendingQueueTextures.clear();
 		gHasPendingQueueTextures.store(false, std::memory_order_release);
@@ -1226,7 +1252,6 @@ namespace RenderPassTexturePool
 		gRecordingEpochs.clear();
 		gRecordedCommandListCount.store(0, std::memory_order_release);
 		gFrameIndex.store(0, std::memory_order_release);
-		gHasHistoryResources.store(false, std::memory_order_release);
 		gConfigurationGeneration.fetch_add(1, std::memory_order_release);
 	}
 

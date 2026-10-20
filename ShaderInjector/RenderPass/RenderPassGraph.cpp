@@ -458,14 +458,19 @@ namespace RenderPassGraph
 				}
 				if (producer.modifiedShaderId != node.modifiedShaderId || producer.rootBoundary != node.rootBoundary)
 				{
-					//Cross-anchor resources cannot be topologically ordered by this plan.
-					//Only an explicit generated mip input is allowed. Its runtime view
-					//is published for this frame; ordinary persistent textures have no
-					//same-frame write guard. The caller must still place the mip producer
-					//at an earlier game event.
+					//cross-anchor consumers opt in to a frame-valid handoff; the caller places the producer at an earlier game event.
+					//declared runtime outputs and generated mips are checked for a successful write in this frame before binding.
 					const bool generatedMip = RenderPass::FindMipChainRuntimeSource(producerPass) &&
 						input.resourceId == RenderPass::MipChainOutputResourceId(producerPass);
-					if (!input.allowCrossAnchor || !generatedMip)
+					const bool declaredOutput = std::any_of(producerPass.runtimeResources.begin(), producerPass.runtimeResources.end(), [&](const auto& definition)
+					{
+						return definition.id == input.resourceId;
+					}) && std::any_of(producerPass.outputs.begin(), producerPass.outputs.end(), [&](const auto& output)
+					{
+						return output.origin == ShaderResource::ResourceOrigin::Runtime && output.temporalView == ShaderResource::TemporalView::Current && output.resourceId == input.resourceId;
+					});
+
+					if (!input.allowCrossAnchor || (!generatedMip && !declaredOutput))
 					{
 						node.valid = false;
 						node.error = "Runtime resource crosses incompatible execution anchors: " + input.resourceId + ".";
@@ -578,6 +583,7 @@ namespace RenderPassGraph
 						boundaryMask = 2;
 					if (std::any_of(candidates.begin(), candidates.end(), [&](size_t candidateIndex)
 									{ return compilation.nodes[candidateIndex].operation == RenderPass::PassOperation::Copy ||
+											 renderPasses[candidateIndex].type == RenderPass::RenderPassType::Custom ||
 											 compilation.nodes[candidateIndex].executionMode == RenderPass::ExecutionMode::FullscreenPixel; }))
 					{
 						planEntry.second.graphicsBoundaryMask |= boundaryMask;
