@@ -19,6 +19,8 @@ namespace ModifiedShader
 		std::vector<uint8_t> compiledBlob;
 		ShaderAnalysis::ShaderAnalysisDisk compiledShaderAnalysis;
 		bool compiledShaderInterfaceCompatible = false;
+		uint64_t pendingCompileSerial = 0;
+		bool compileFailed = false;
 	};
 
 	struct ModifiedShaderPackageDisk
@@ -55,6 +57,8 @@ namespace ModifiedShader
 		void RebuildVariantIndex();
 
 		const ModifiedShaderCompiledVariant* FindVariantForDefines(const std::vector<ShaderDefine>& defines) const;
+
+		ModifiedShaderCompiledVariant* FindVariantForDefinesMutable(const std::vector<ShaderDefine>& defines);
 
 		//fingerprint matches in these packages cannot fall back to the default variant.
 		bool HasPerTargetDefines() const;

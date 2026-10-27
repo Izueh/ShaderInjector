@@ -45,6 +45,7 @@
 #include "dsound_proxy.h"
 #include "HookD3D12.h"
 #include "HookD3D12DeviceLifecycle.h"
+#include "ModifiedShader/DatabaseModifiedShaders.h"
 #include "ShaderTarget/DatabaseShaderTargets.h"
 #include "Input/HookInput.h"
 #include "IO/ShaderInjectorIO.h"
@@ -243,6 +244,14 @@ namespace HookD3D12
 
 	void QueueShaderTargetApplyWork()
 	{
+		gShaderTargetApplyDirty = true;
+	}
+
+	static std::atomic<bool> gRestartShaderTargetApplyScan = false;
+
+	void RestartShaderTargetApplyScan()
+	{
+		gRestartShaderTargetApplyScan = true;
 		gShaderTargetApplyDirty = true;
 	}
 
@@ -2136,6 +2145,8 @@ namespace HookD3D12
 
 	void ApplyShaderTargetPSOs()
 	{
+		DatabaseModifiedShaders::ProcessCompletedCompiles();
+
 		if (!IsPipelineCreationIdle())
 			return;
 
@@ -2152,6 +2163,12 @@ namespace HookD3D12
 			RefreshLoadedShaderTargets();
 
 		std::lock_guard<std::mutex> lock(gPipelineMutex);
+
+		if (gRestartShaderTargetApplyScan.exchange(false))
+		{
+			gGraphicsShaderTargetApplyCursor = 0;
+			gStreamShaderTargetApplyCursor = 0;
+		}
 
 		bool capturedReplacementAttempted = false;
 		const uint64_t initialCreateAttemptCount = gReplacementPSOCreateAttemptCount;
@@ -2933,6 +2950,8 @@ namespace HookD3D12
 		ShaderAutomaticDiscovery::Shutdown();
 		//join the patch worker before the pipelines and devices it uses are released.
 		ShaderPatchRuntime::Shutdown();
+		//join compile workers before the package blobs and shader targets they write are released.
+		DatabaseModifiedShaders::Shutdown();
 		ResetOverlayStartupGate();
 
 		{
