@@ -264,6 +264,7 @@ namespace HookD3D12
 	void QueueShaderTargetApplyWork();
 	void RestartShaderTargetApplyScan();
 	void InvalidateAllReplacementPSOs();
+	void SwapReplacementPSOsForShaderTargetLocked(const std::string& shaderTargetName);
 	void ResetUncapturedReplacementAttempts();
 	void ClearShaderMarkers();
 	void InvalidateShaderMarkerPSOs();

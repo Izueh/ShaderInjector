@@ -21,6 +21,7 @@
 #include <wrl/client.h>
 
 #include "HookD3D12.h"
+#include "HookD3D12/HookD3D12RetiredPSOTracker.h"
 #include "GUI/ShaderInjectorGUI.h"
 #include "Globals.h"
 #include "Performance/PerformanceMetrics.h"
@@ -2330,6 +2331,10 @@ namespace RenderPassRuntime
 			commandList->SetGraphicsRootDescriptorTable(binding.appendedTableIndex, addedTable);
 		}
 		commandList->SetPipelineState(binding.pipelineState);
+
+		//the hook returns early inside the injection scope, so record this bind here.
+		HookD3D12::RecordReplacementBinding(binding.pipelineState, commandList);
+
 		state.replacementPassActive = true;
 		state.shaderPatchActive = true;
 	}

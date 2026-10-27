@@ -108,8 +108,11 @@ namespace HookD3D12
 		if (replacementIndex >= (int)gLoadedShaderTargetBlobs.size())
 			gLoadedShaderTargetBlobs.resize(gLoadedShaderTargets.size());
 
+		ShaderTarget::ShaderTargetDisk& replacement = gLoadedShaderTargets[replacementIndex];
 		gLoadedShaderTargetBlobs[replacementIndex] = blob;
-		InvalidateAllReplacementPSOs();
+		++replacement.modifiedShaderBlobGeneration;
+
+		SwapReplacementPSOsForShaderTargetLocked(replacement.name);
 	}
 
 	//using the selected index of currently selected shader replacement...
