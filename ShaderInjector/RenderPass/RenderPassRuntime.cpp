@@ -2734,6 +2734,7 @@ namespace RenderPassRuntime
 					ID3D12PipelineState* replacementPipeline = RenderPassReplacement::GetOrCreatePipeline(
 						renderPass,
 						state.pipelineState,
+						targetIt->second,
 						executionError);
 					if (replacementPipeline)
 					{
@@ -2809,7 +2810,7 @@ namespace RenderPassRuntime
 						ID3D12PipelineState* computePipelineState = graphicsComputePipelineState;
 
 						if (computePipeline)
-							computePipelineState = RenderPassReplacement::GetOrCreatePipeline(renderPass, state.pipelineState, executionError);
+							computePipelineState = RenderPassReplacement::GetOrCreatePipeline(renderPass, state.pipelineState, targetIt->second, executionError);
 						executionSucceeded = computePipelineState != nullptr;
 						RenderPassTexturePool::TextureView stageSource = sourceTexture;
 						for (const RenderPassTexturePool::TextureView& stageTarget : stageTargets)
@@ -2911,7 +2912,7 @@ namespace RenderPassRuntime
 
 					ID3D12PipelineState* computePipelineState = graphicsComputePipelineState;
 					if (shaderResourcesBound && computePipeline)
-						computePipelineState = RenderPassReplacement::GetOrCreatePipeline(renderPass, state.pipelineState, executionError);
+						computePipelineState = RenderPassReplacement::GetOrCreatePipeline(renderPass, state.pipelineState, targetIt->second, executionError);
 					UINT threadGroupCountX = 0;
 					UINT threadGroupCountY = 0;
 					UINT threadGroupCountZ = 0;

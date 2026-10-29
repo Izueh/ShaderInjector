@@ -45,6 +45,4 @@ namespace DatabaseModifiedShaders::Detail
 		ShaderAnalysis::ShaderAnalysisDisk& outAnalysis);
 
 	int QueuePackageCompiles(ModifiedShader::ModifiedShaderPackageDisk& modifiedShader);
-
-	void RequestVariantCompile(const std::string& packageId, const std::vector<ModifiedShader::ShaderDefine>& defines);
 } //namespace DatabaseModifiedShaders::Detail

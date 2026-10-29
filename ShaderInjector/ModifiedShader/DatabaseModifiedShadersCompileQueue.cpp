@@ -15,6 +15,7 @@
 #include "GUI/ShaderInjectorGUI.h"
 #include "HookD3D12/HookD3D12.h"
 #include "IO/ShaderInjectorIO.h"
+#include "RenderPass/DatabaseRenderPasses.h"
 
 namespace DatabaseModifiedShaders
 {
@@ -57,6 +58,7 @@ namespace DatabaseModifiedShaders
 
 	static std::vector<DeferredVariantRequest> gDeferredVariantRequests;
 	static std::unordered_set<std::string> gDeferredVariantRequestKeys;
+	static bool gRenderPassPublishPending = false;
 
 	static std::string CompileJobKey(const std::string& packageId, const std::vector<ModifiedShader::ShaderDefine>& defines)
 	{
@@ -117,9 +119,14 @@ namespace DatabaseModifiedShaders
 			gCompileWorkers.emplace_back(CompileWorker);
 	}
 
-	static std::shared_ptr<const ModifiedShader::ModifiedShaderPackageDisk> MakeCompileSnapshot(const ModifiedShader::ModifiedShaderPackageDisk& modifiedShader)
+	static std::shared_ptr<const ModifiedShader::ModifiedShaderPackageDisk> MakeCompileSnapshot(
+		const ModifiedShader::ModifiedShaderPackageDisk& modifiedShader,
+		const std::string& ownerId,
+		const std::string& sourcePath)
 	{
 		auto snapshot = std::make_shared<ModifiedShader::ModifiedShaderPackageDisk>(modifiedShader);
+		snapshot->id = ownerId;
+		snapshot->sourcePath = sourcePath;
 		snapshot->compiledBlob.clear();
 		snapshot->compiledVariants.clear();
 		snapshot->variantIndexByShaderHash.clear();
@@ -184,17 +191,43 @@ namespace DatabaseModifiedShaders
 		return true;
 	}
 
-	void Detail::RequestVariantCompile(const std::string& packageId, const std::vector<ModifiedShader::ShaderDefine>& defines)
+	void RequestVariantCompile(const std::string& ownerId, const std::vector<ModifiedShader::ShaderDefine>& defines)
 	{
 		std::lock_guard<std::mutex> lock(Detail::gCompileMutex);
 
 		if (gCompileStopRequested)
 			return;
 
-		if (!gDeferredVariantRequestKeys.insert(CompileJobKey(packageId, defines)).second)
+		if (!gDeferredVariantRequestKeys.insert(CompileJobKey(ownerId, defines)).second)
 			return;
 
-		gDeferredVariantRequests.push_back({packageId, defines});
+		gDeferredVariantRequests.push_back({ownerId, defines});
+	}
+
+	static ModifiedShader::ModifiedShaderCompiledVariant* FindOwnerVariant(
+		const std::string& ownerId,
+		const std::vector<ModifiedShader::ShaderDefine>& defines,
+		ModifiedShader::ModifiedShaderPackageDisk*& outModifiedShader)
+	{
+		outModifiedShader = Detail::FindMutableModifiedShaderById(ownerId);
+
+		if (outModifiedShader)
+			return outModifiedShader->FindVariantForDefinesMutable(defines);
+
+		RenderPass::RenderPassDisk* renderPass = DatabaseRenderPasses::FindRenderPassById(ownerId);
+
+		if (!renderPass)
+			return nullptr;
+
+		const auto variant = std::find_if(renderPass->fragmentShaderVariants.begin(), renderPass->fragmentShaderVariants.end(), [&](const ModifiedShader::ModifiedShaderCompiledVariant& candidate)
+		{
+			return candidate.defines == defines;
+		});
+
+		if (variant == renderPass->fragmentShaderVariants.end())
+			return nullptr;
+
+		return &*variant;
 	}
 
 	static void DrainDeferredVariantRequests()
@@ -215,8 +248,10 @@ namespace DatabaseModifiedShaders
 				continue;
 
 			ModifiedShader::ModifiedShaderPackageDisk* modifiedShader = Detail::FindMutableModifiedShaderById(request.packageId);
+			const RenderPass::RenderPassDisk* renderPass = modifiedShader ? nullptr : DatabaseRenderPasses::FindRenderPassById(request.packageId);
+			const ModifiedShader::ModifiedShaderPackageDisk* snapshotPackage = renderPass ? DatabaseRenderPasses::ResolveModifiedShader(*renderPass) : modifiedShader;
 
-			if (!modifiedShader)
+			if (!snapshotPackage)
 				continue;
 
 			std::vector<ModifiedShader::ModifiedShaderCompiledVariant*> pendingVariants;
@@ -226,7 +261,8 @@ namespace DatabaseModifiedShaders
 				if (packageRequest.packageId != request.packageId)
 					continue;
 
-				ModifiedShader::ModifiedShaderCompiledVariant* variant = modifiedShader->FindVariantForDefinesMutable(packageRequest.defines);
+				ModifiedShader::ModifiedShaderPackageDisk* ownerPackage = nullptr;
+				ModifiedShader::ModifiedShaderCompiledVariant* variant = FindOwnerVariant(packageRequest.packageId, packageRequest.defines, ownerPackage);
 
 				if (variant)
 					pendingVariants.push_back(variant);
@@ -235,7 +271,9 @@ namespace DatabaseModifiedShaders
 			if (pendingVariants.empty())
 				continue;
 
-			const std::shared_ptr<const ModifiedShader::ModifiedShaderPackageDisk> snapshot = MakeCompileSnapshot(*modifiedShader);
+			const std::shared_ptr<const ModifiedShader::ModifiedShaderPackageDisk> snapshot = renderPass
+				? MakeCompileSnapshot(*snapshotPackage, renderPass->id, renderPass->fragmentShaderSourcePath)
+				: MakeCompileSnapshot(*snapshotPackage, snapshotPackage->id, snapshotPackage->sourcePath);
 			std::lock_guard<std::mutex> lock(Detail::gCompileMutex);
 
 			if (gCompileStopRequested)
@@ -270,7 +308,7 @@ namespace DatabaseModifiedShaders
 			}
 		}
 
-		const std::shared_ptr<const ModifiedShader::ModifiedShaderPackageDisk> snapshot = MakeCompileSnapshot(modifiedShader);
+		const std::shared_ptr<const ModifiedShader::ModifiedShaderPackageDisk> snapshot = MakeCompileSnapshot(modifiedShader, modifiedShader.id, modifiedShader.sourcePath);
 		size_t loadedCount = 0;
 		int queuedCount = 0;
 
@@ -305,6 +343,37 @@ namespace DatabaseModifiedShaders
 			" of=" + std::to_string(modifiedShader.compiledVariants.size()) +
 			" loadedFirst=" + std::to_string(loadedCount));
 
+		for (const RenderPass::RenderPassDisk& renderPass : DatabaseRenderPasses::GetRenderPasses())
+		{
+			if (renderPass.fragmentShaderVariants.empty() || DatabaseRenderPasses::ResolveModifiedShaderId(renderPass) != modifiedShader.id)
+				continue;
+
+			queuedCount += QueueSourceCompiles(modifiedShader, renderPass.id, renderPass.fragmentShaderSourcePath, DatabaseRenderPasses::FindRenderPassById(renderPass.id)->fragmentShaderVariants);
+		}
+
+		return queuedCount;
+	}
+
+	int QueueSourceCompiles(
+		const ModifiedShader::ModifiedShaderPackageDisk& modifiedShader,
+		const std::string& ownerId,
+		const std::string& sourcePath,
+		std::vector<ModifiedShader::ModifiedShaderCompiledVariant>& variants)
+	{
+		const std::shared_ptr<const ModifiedShader::ModifiedShaderPackageDisk> snapshot = MakeCompileSnapshot(modifiedShader, ownerId, sourcePath);
+		int queuedCount = 0;
+
+		std::lock_guard<std::mutex> lock(Detail::gCompileMutex);
+
+		if (gCompileStopRequested)
+			return 0;
+
+		for (ModifiedShader::ModifiedShaderCompiledVariant& variant : variants)
+		{
+			if (QueueVariantCompileLocked(snapshot, variant, false, true))
+				++queuedCount;
+		}
+
 		return queuedCount;
 	}
 
@@ -336,12 +405,8 @@ namespace DatabaseModifiedShaders
 
 			for (CompileResult& result : results)
 			{
-				ModifiedShader::ModifiedShaderPackageDisk* modifiedShader = Detail::FindMutableModifiedShaderById(result.packageId);
-
-				if (!modifiedShader)
-					continue;
-
-				ModifiedShader::ModifiedShaderCompiledVariant* variant = modifiedShader->FindVariantForDefinesMutable(result.defines);
+				ModifiedShader::ModifiedShaderPackageDisk* modifiedShader = nullptr;
+				ModifiedShader::ModifiedShaderCompiledVariant* variant = FindOwnerVariant(result.packageId, result.defines, modifiedShader);
 
 				if (!variant)
 					continue;
@@ -378,12 +443,8 @@ namespace DatabaseModifiedShaders
 
 				for (CompileResult* readyResult : readyResults)
 				{
-					ModifiedShader::ModifiedShaderPackageDisk* modifiedShader = Detail::FindMutableModifiedShaderById(readyResult->packageId);
-
-					if (!modifiedShader)
-						continue;
-
-					ModifiedShader::ModifiedShaderCompiledVariant* variant = modifiedShader->FindVariantForDefinesMutable(readyResult->defines);
+					ModifiedShader::ModifiedShaderPackageDisk* modifiedShader = nullptr;
+					ModifiedShader::ModifiedShaderCompiledVariant* variant = FindOwnerVariant(readyResult->packageId, readyResult->defines, modifiedShader);
 
 					if (!variant)
 						continue;
@@ -393,7 +454,15 @@ namespace DatabaseModifiedShaders
 						variant->compiledBlob = std::move(readyResult->blob);
 						variant->compiledShaderAnalysis = readyResult->analysis;
 						variant->compiledShaderInterfaceCompatible = true;
-						Detail::UpdatePackageCompiledState(*modifiedShader);
+
+						if (modifiedShader)
+							Detail::UpdatePackageCompiledState(*modifiedShader);
+					}
+
+					if (!modifiedShader)
+					{
+						gRenderPassPublishPending = true;
+						continue;
 					}
 
 					if (!modifiedShader->enabled)
@@ -436,6 +505,13 @@ namespace DatabaseModifiedShaders
 						" names=" + updatedTargets);
 				}
 			}
+
+		}
+
+		if (reportBatch && gRenderPassPublishPending)
+		{
+			gRenderPassPublishPending = false;
+			DatabaseRenderPasses::PublishRuntimeConfiguration();
 		}
 
 		if (!reportBatch)

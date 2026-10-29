@@ -562,7 +562,7 @@ namespace DatabaseModifiedShaders
 		}
 
 		if (needsCompile)
-			Detail::RequestVariantCompile(modifiedShader.id, defines);
+			RequestVariantCompile(modifiedShader.id, defines);
 
 		return ready;
 	}
@@ -591,6 +591,35 @@ namespace DatabaseModifiedShaders
 		std::vector<uint8_t>& outBlob)
 	{
 		return ReadyVariantForShader(modifiedShader, originalShaderBytecodeHash, shaderBytecodeHashAliases, &outBlob, nullptr);
+	}
+
+	bool TryGetVariantDefinesForShader(
+		const ModifiedShader::ModifiedShaderPackageDisk& modifiedShader,
+		const std::string& originalShaderBytecodeHash,
+		const std::vector<std::string>& shaderBytecodeHashAliases,
+		std::vector<ModifiedShader::ShaderDefine>& outDefines)
+	{
+		std::lock_guard<std::mutex> lock(Detail::gCompileMutex);
+		const ModifiedShader::ModifiedShaderCompiledVariant* variant = modifiedShader.FindVariantForShader(originalShaderBytecodeHash, shaderBytecodeHashAliases);
+
+		if (!variant)
+			return false;
+
+		outDefines = variant->defines;
+		return true;
+	}
+
+	void LoadSourceVariants(
+		const ModifiedShader::ModifiedShaderPackageDisk& modifiedShader,
+		const std::string& sourcePath,
+		const std::string& compiledBlobPath,
+		std::vector<ModifiedShader::ModifiedShaderCompiledVariant>& outVariants)
+	{
+		ModifiedShader::ModifiedShaderPackageDisk sourcePackage = modifiedShader;
+		sourcePackage.sourcePath = sourcePath;
+		sourcePackage.compiledBlobPath = compiledBlobPath;
+		Detail::LoadPackageVariants(sourcePackage);
+		outVariants = std::move(sourcePackage.compiledVariants);
 	}
 
 	bool HasCompiledVariant(const ModifiedShader::ModifiedShaderPackageDisk& modifiedShader)
