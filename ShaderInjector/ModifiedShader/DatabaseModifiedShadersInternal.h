@@ -48,6 +48,4 @@ namespace DatabaseModifiedShaders::Detail
 	//an explicit request supersedes a queued or running job and clears a previous failure.
 	//returns how many jobs were accepted.
 	int QueuePackageCompiles(ModifiedShader::ModifiedShaderPackageDisk& modifiedShader);
-
-	void RequestVariantCompile(const std::string& packageId, const std::vector<ModifiedShader::ShaderDefine>& defines);
 } //namespace DatabaseModifiedShaders::Detail

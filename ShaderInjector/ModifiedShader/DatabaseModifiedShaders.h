@@ -63,4 +63,24 @@ namespace DatabaseModifiedShaders
 		const std::string& originalShaderBytecodeHash,
 		const std::vector<std::string>& shaderBytecodeHashAliases,
 		std::vector<uint8_t>& outBlob);
+
+	bool TryGetVariantDefinesForShader(
+		const ModifiedShader::ModifiedShaderPackageDisk& modifiedShader,
+		const std::string& originalShaderBytecodeHash,
+		const std::vector<std::string>& shaderBytecodeHashAliases,
+		std::vector<ModifiedShader::ShaderDefine>& outDefines);
+
+	void LoadSourceVariants(
+		const ModifiedShader::ModifiedShaderPackageDisk& modifiedShader,
+		const std::string& sourcePath,
+		const std::string& compiledBlobPath,
+		std::vector<ModifiedShader::ModifiedShaderCompiledVariant>& outVariants);
+
+	void RequestVariantCompile(const std::string& ownerId, const std::vector<ModifiedShader::ShaderDefine>& defines);
+
+	int QueueSourceCompiles(
+		const ModifiedShader::ModifiedShaderPackageDisk& modifiedShader,
+		const std::string& ownerId,
+		const std::string& sourcePath,
+		std::vector<ModifiedShader::ModifiedShaderCompiledVariant>& variants);
 } //namespace DatabaseModifiedShaders
